@@ -348,6 +348,56 @@ it('releases an idle lane when the parent session expires', async () => {
   }
 });
 
+it('rejects stream input at the expiry instant even when the timer has not run', () => {
+  vi.useFakeTimers();
+  try {
+    const now = 1_791_000_000_000;
+    vi.setSystemTime(now);
+    const group = { ...syntheticGroup(), expires: now / 1000 + 1 };
+    const client = new FakeSocket();
+    const dial = vi.fn();
+    const lane = new Lane(client, 1, transportFixture().secret, group, dial);
+    lane.attach();
+    vi.setSystemTime(now + 1000);
+    client.receive(encodeFrame(1, 1));
+    expect(client.code).toBe(4001);
+    expect(client.sent).toHaveLength(0);
+    expect(group.active).toBe(0);
+    expect(group.bytes).toBe(0);
+    expect(dial).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('emits one lane CLOSE for a disconnected KWS peer and keeps the sibling usable', async () => {
+  const fixture = transportFixture();
+  const peer = new FakeSocket(), sibling = new FakeSocket();
+  const a = laneOf(1, fixture, async () => peer);
+  const b = laneOf(2, fixture, async () => sibling);
+  try {
+    a.client.receive(encodeFrame(2, 1, fixture.wire));
+    b.client.receive(encodeFrame(2, 2, fixture.wire));
+    await until(() => !a.lane.upBusy && !b.lane.upBusy);
+    expect(peer.readyState).toBe(1);
+    expect(sibling.readyState).toBe(1);
+    peer.close();
+    peer.dispatchEvent(new Event('error'));
+    expect(frames(a.client, 3)).toHaveLength(1);
+    const data = Buffer.from([1, 2, 3]);
+    sibling.receive(headers(sibling, 0xdd, -2).reverse.update(data));
+    await until(() => !b.lane.downBusy);
+    expect(fixture.fromWorker.update(Buffer.concat(frames(b.client, 2)))).toEqual(data);
+    expect(b.client.readyState).toBe(1);
+    expect(a.group.bytes).toBe(0);
+    expect(a.group.active).toBe(0);
+  } finally {
+    a.client.close();
+    b.client.close();
+  }
+});
+
 it('releases the upstream data charge before a congested downstream send', async () => {
   const fixture = transportFixture();
   const peer = new FakeSocket();

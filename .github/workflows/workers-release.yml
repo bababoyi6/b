@@ -23,11 +23,13 @@ jobs:
       - run: npm ci
       - name: Verify tag matches package version
         run: node -e "const version = require('./package.json').version; if (process.env.GITHUB_REF_NAME !== 'v' + version + '-workers') throw new Error('Workers tag does not match package.json')"
+      - name: Verify the release commit is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - run: node --check telegram_webproxy.js
       - run: npm test
       - run: npm run test:runtime
-      - run: node --expose-gc benchmarks/transport.mjs --quick --sizes --verify --tcp --tcp-baseline --against=432737c60076db6d20e075e37358b8421d5b9085
-      - run: node benchmarks/startup.mjs --quick --against=432737c60076db6d20e075e37358b8421d5b9085
+      - run: node --expose-gc benchmarks/transport.mjs --quick --sizes --verify --tcp --tcp-baseline --against=b5835145b157f22691b671470856d0d37f07316e
+      - run: node benchmarks/startup.mjs --quick --against=b5835145b157f22691b671470856d0d37f07316e
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: workers-package

@@ -84,8 +84,9 @@ it.each([
     sockets[0].close();
     expect(messages.some(value => value instanceof ArrayBuffer && new DataView(value).getUint32(0) === 0x03000001)).toBe(true);
     expect(sockets[1].readyState).toBe(1);
+    const lateClose = sockets[2].onclose;
     sockets[1].close(4001);
-    sockets[2].onclose({ code: 4001 });
+    lateClose({ code: 4001 });
     expect(messages.filter(value => typeof value === 'string' && JSON.parse(value).t === 'close')).toHaveLength(1);
     expect(calls.filter(([, options]) => options.method === 'DELETE')).toHaveLength(0);
     expect(sockets[2].readyState).toBe(3);
@@ -94,6 +95,216 @@ it.each([
   }
   expect(sockets.every(socket => socket.readyState === 3)).toBe(true);
   expect(injected.onmessage).toBeNull();
+});
+
+async function bridgeFixture({ broken = [], renew = () => new Response(null, { status: 503 }) } = {}) {
+  const response = await worker.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), ENV);
+  const script = /<script nonce="[^"]+">([\s\S]*?)<\/script>/.exec(await response.text())[1];
+  vi.useFakeTimers();
+  const epoch = Date.now();
+  const messages = [], calls = [], sockets = new Map(), attempts = [], listeners = new Map();
+  const injected = { postMessage(data) { messages.push(typeof data === 'string' ? JSON.parse(data) : data); } };
+  class BrowserSocket extends FakeSocket {
+    static OPEN = 1;
+    constructor(_, protocol) {
+      super();
+      const id = Number(protocol.split('.').at(-1));
+      attempts.push(id);
+      if (broken.includes(id)) throw new Error('synthetic browser setup failure');
+      this.protocol = protocol;
+      sockets.set(id, this);
+    }
+    open(protocol = this.protocol) {
+      this.protocol = protocol;
+      this.accept();
+      this.onopen?.();
+    }
+    disconnect(code) {
+      const onclose = this.onclose;
+      this.close(code);
+      onclose?.({ code });
+    }
+  }
+  runInNewContext(script, {
+    ArrayBuffer, Uint8Array, DataView, URL, AbortController, setTimeout, clearTimeout, parent: {},
+    TelegramWebProxy: injected,
+    location: { hash: '#android=' + 'A'.repeat(43), pathname: '/' },
+    history: { replaceState() {} },
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    Math: Object.assign(Object.create(Math), { random: () => 0 }),
+    performance: { now: () => Date.now() - epoch },
+    WebSocket: BrowserSocket,
+    async fetch(url, options) {
+      calls.push(options);
+      return url.endsWith('/renew') ? renew(options) : new Response(null, { status: 204 });
+    },
+  });
+  const send = data => injected.onmessage?.({ data });
+  send(HELLO.buffer);
+  return {
+    sockets, attempts, calls, send, messages,
+    open(...ids) { send(Uint8Array.from(Buffer.concat(ids.map(id => encodeFrame(1, id)))).buffer); },
+    localCloses() {
+      return messages.filter(value => value instanceof ArrayBuffer && new Uint8Array(value)[0] === 3)
+        .map(value => new DataView(value).getUint32(0) & 0xffffff);
+    },
+    globalCloses: () => messages.filter(value => value.t === 'close').length,
+    cleanup: () => listeners.get('pagehide')(),
+    active: () => typeof injected.onmessage === 'function',
+  };
+}
+
+it('isolates a new lane timeout, constructor failure and abnormal close from working traffic', async () => {
+  const b = await bridgeFixture({ broken: [3] });
+  b.open(1);
+  const healthy = b.sockets.get(1);
+  healthy.open();
+  b.open(2, 3, 4);
+  const hung = b.sockets.get(2);
+  const delayedClose = hung.onclose;
+  const delayedOpen = hung.onopen;
+  b.sockets.get(4).disconnect(1006);
+  await vi.advanceTimersByTimeAsync(7999);
+  expect(b.localCloses()).toEqual([3, 4]);
+  await vi.advanceTimersByTimeAsync(1);
+  delayedOpen();
+  delayedClose({ code: 1006 });
+  expect(b.localCloses()).toEqual([3, 4, 2]);
+  const data = encodeFrame(2, 1, Uint8Array.of(17));
+  b.send(data.buffer);
+  healthy.onmessage({ data: data.buffer });
+  expect(healthy.sent.at(-1)).toEqual(Buffer.from(data));
+  expect(b.messages).toContain(data.buffer);
+  expect(b.globalCloses()).toBe(0);
+  expect(b.attempts).toEqual([1, 2, 3, 4]);
+  expect(healthy.readyState).toBe(1);
+  expect(hung.readyState).toBe(3);
+  expect(hung.onopen).toBeNull();
+  b.cleanup();
+  expect(b.calls.map(({ method }) => method)).toEqual(['DELETE']);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it('lets a sibling finish initial setup after a concurrent lane fails', async () => {
+  const b = await bridgeFixture({ broken: [1] });
+  b.open(1, 2);
+  b.sockets.get(2).open();
+  await vi.advanceTimersByTimeAsync(30000);
+  expect(b.localCloses()).toEqual([1]);
+  expect(b.globalCloses()).toBe(0);
+  expect(b.sockets.get(2).readyState).toBe(1);
+  b.cleanup();
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it('forwards a backend CLOSE and ignores the following socket-close event', async () => {
+  const b = await bridgeFixture();
+  b.open(1, 2);
+  for (const ws of b.sockets.values()) ws.open();
+  const first = b.sockets.get(1);
+  const socketClose = first.onclose;
+  first.onmessage({ data: encodeFrame(3, 1).buffer });
+  socketClose({ code: 1000 });
+  expect(b.localCloses()).toEqual([1]);
+  expect(b.globalCloses()).toBe(0);
+  expect(b.sockets.get(2).readyState).toBe(1);
+  b.cleanup();
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it.each([false, true])('exits initial setup safely with a failed lane (%s)', async connect => {
+  const b = await bridgeFixture();
+  if (connect) b.open(1);
+  const limit = connect ? 8000 : 30000;
+  await vi.advanceTimersByTimeAsync(limit - 1);
+  expect(b.globalCloses()).toBe(0);
+  await vi.advanceTimersByTimeAsync(1);
+  expect(b.globalCloses()).toBe(1);
+  expect(b.localCloses()).toEqual([]);
+  expect(b.active()).toBe(false);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it.each(['subprotocol', 'frame', 'policy', 'reused id'])('fails the whole Bridge for %s', async failure => {
+  const b = await bridgeFixture();
+  b.open(1, 2);
+  const first = b.sockets.get(1), second = b.sockets.get(2);
+  first.open();
+  if (failure === 'subprotocol') second.open('wrong');
+  else {
+    second.open();
+    if (failure === 'frame') second.onmessage({ data: encodeFrame(2, 1, Uint8Array.of(1)).buffer });
+    if (failure === 'policy') second.disconnect(1008);
+    if (failure === 'reused id') {
+      second.disconnect(1006);
+      b.open(2);
+    }
+  }
+  b.cleanup();
+  expect(b.attempts).toEqual([1, 2]);
+  expect(b.globalCloses()).toBe(1);
+  expect(first.readyState).toBe(3);
+  expect(second.readyState).toBe(3);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it('bounds a shared transient renewal failure while preserving a healthy lane', async () => {
+  const renew = vi.fn(async () => new Response(null, { status: 503 }));
+  const b = await bridgeFixture({ renew });
+  b.open(1);
+  b.sockets.get(1).open();
+  await vi.advanceTimersByTimeAsync(90000);
+  b.open(2, 3);
+  await vi.advanceTimersByTimeAsync(1800);
+  expect(renew).toHaveBeenCalledTimes(4);
+  expect(b.localCloses()).toEqual([2, 3]);
+  expect(b.attempts).toEqual([1]);
+  expect(b.sockets.get(1).readyState).toBe(1);
+  expect(b.globalCloses()).toBe(0);
+  b.cleanup();
+  await vi.advanceTimersByTimeAsync(60000);
+  expect(renew).toHaveBeenCalledTimes(4);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it.each([404, 204])('fails closed on a renewal rejection or malformed response (%s)', async status => {
+  const renew = vi.fn(async () => new Response(null, { status }));
+  const b = await bridgeFixture({ renew });
+  b.open(1);
+  b.sockets.get(1).open();
+  await vi.advanceTimersByTimeAsync(81000);
+  b.open(2, 3);
+  await vi.advanceTimersByTimeAsync(0);
+  expect(renew).toHaveBeenCalledTimes(1);
+  expect(b.globalCloses()).toBe(1);
+  expect(b.sockets.get(1).readyState).toBe(3);
+  expect(b.calls.map(({ method }) => method)).toEqual(['POST']);
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it('aborts pending renewal at parent expiry and ignores a late response and sibling events', async () => {
+  let respond;
+  const renew = vi.fn(() => new Promise(resolve => { respond = resolve; }));
+  const b = await bridgeFixture({ renew });
+  b.open(1, 2);
+  for (const ws of b.sockets.values()) ws.open();
+  const parentLifetime = (12 * 3600 + 120) * 1000;
+  await vi.advanceTimersByTimeAsync(parentLifetime - 1000);
+  b.open(3, 4);
+  expect(renew).toHaveBeenCalledTimes(1);
+  const staleClose = b.sockets.get(2).onclose;
+  await vi.advanceTimersByTimeAsync(1000);
+  b.sockets.get(1).disconnect(4001);
+  staleClose({ code: 4001 });
+  staleClose({ code: 1006 });
+  expect(b.calls[0].signal.aborted).toBe(true);
+  respond(new Response(null, { status: 204, headers: { 'X-Session-Token': 'A'.repeat(43), 'X-Session-TTL': '300' } }));
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(b.attempts).toEqual([1, 2]);
+  expect(b.globalCloses()).toBe(1);
+  expect(b.localCloses()).toEqual([]);
+  expect(b.calls.map(({ method }) => method)).toEqual(['POST']);
+  expect(vi.getTimerCount()).toBe(0);
 });
 
 it.each([404, 503])('classifies a Session HTTP %s and cancels the pending retry on pagehide', async status => {

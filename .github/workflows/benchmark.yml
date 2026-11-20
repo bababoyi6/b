@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
-      BENCHMARK_BASELINE: 59aeb06b19ed24b90555ce3d88de668410e0ebb5
+      BENCHMARK_BASELINE: b5835145b157f22691b671470856d0d37f07316e
     steps:
       - uses: actions/checkout@v6
         with:
@@ -27,9 +27,9 @@ jobs:
           node-version: '24'
       - if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
         run: |
-          npm run bench -- --tcp --against="$BENCHMARK_BASELINE"
-          npm run bench:startup -- --against="$BENCHMARK_BASELINE"
+          node --expose-gc benchmarks/transport.mjs --tcp --against="$BENCHMARK_BASELINE"
+          node benchmarks/startup.mjs --against="$BENCHMARK_BASELINE"
       - if: github.event_name != 'workflow_dispatch' && github.ref_type != 'tag'
         run: |
-          npm run bench -- --quick --tcp --against="$BENCHMARK_BASELINE"
-          npm run bench:startup -- --quick --against="$BENCHMARK_BASELINE"
+          node --expose-gc benchmarks/transport.mjs --quick --tcp --against="$BENCHMARK_BASELINE"
+          node benchmarks/startup.mjs --quick --against="$BENCHMARK_BASELINE"

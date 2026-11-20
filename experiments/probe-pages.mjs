@@ -7,9 +7,12 @@ import { independentCTR, packet } from '../tests/fixtures.js';
 const [passwordFile, ...options] = process.argv.slice(2);
 const includeMedia = options.includes('--media');
 const paired = options.includes('--paired');
-const targets = options.filter(arg => arg !== '--media' && arg !== '--paired');
-if (!passwordFile || !targets.length || (paired && targets.length !== 2)) {
-  throw new Error('Usage: node experiments/probe-pages.mjs <test-password-file> [--media] [--paired] <https-url> [...]');
+const roundsOption = options.find(arg => arg.startsWith('--rounds='));
+const rounds = roundsOption === undefined ? 3 : Number(roundsOption.slice('--rounds='.length));
+const targets = options.filter(arg => arg !== '--media' && arg !== '--paired' && arg !== roundsOption);
+if (!passwordFile || !targets.length || (paired && targets.length !== 2) ||
+    !Number.isInteger(rounds) || rounds < 1 || rounds > 3) {
+  throw new Error('Usage: node experiments/probe-pages.mjs <test-password-file> [--media] [--paired] [--rounds=1..3] <https-url> [...]');
 }
 const password = readFileSync(passwordFile, 'utf8').trimEnd();
 assert.ok(password.length >= 16);
@@ -111,7 +114,7 @@ for (const target of targets) {
 }
 
 const results = new Map(deployments.map(({ origin }) => [origin, []]));
-for (let round = 0; round < 3; round++) {
+for (let round = 0; round < rounds; round++) {
   const order = round % 2 ? [...deployments].reverse() : deployments;
   for (let dc = 1; dc <= 5; dc++) {
     for (const media of includeMedia ? [false, true] : [false]) {

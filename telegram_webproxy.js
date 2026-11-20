@@ -544,7 +544,7 @@ async function route(request, env, dial, directTCP) {
     return response;
   }
   const auth = await authenticateToken(cfg, host, purpose, claims);
-  if (!auth) return unavailable();
+  if (!auth || now() >= auth.expires) return unavailable();
   if (upgrade) return upgradeLane(request, cfg, host, upgrade, auth, started, dial, directTCP);
   const deadline = view(auth.id).getUint32(0);
   const key = groupKey(host, auth.id);
@@ -559,19 +559,23 @@ async function route(request, env, dial, directTCP) {
     if (!(await readExactBody(request, EMPTY)) || now() >= auth.expires || groups.get(key)?.deleted) return unavailable();
     const expires = Math.min(now() + TICKET_LIFETIME, auth.expires);
     const ticket = await issueToken(cfg, host, SESSION, expires, auth.id);
+    const ttl = expires - now();
+    if (ttl <= 0 || groups.get(key)?.deleted) return unavailable();
     return new Response(null, { status: 204, headers: {
-      ...noStore, 'X-Session-Token': ticket, 'X-Session-TTL': String(expires - now()),
+      ...noStore, 'X-Session-Token': ticket, 'X-Session-TTL': String(ttl),
     } });
   }
   if (!(await readExactBody(request, helloFrame)) || now() >= auth.expires || groups.get(key)?.deleted) return unavailable();
   // Byte-identical creation retries get the same tickets in every isolate.
   const expires = auth.expires - BOOT_LIFETIME + TICKET_LIFETIME;
   const [ticket, refresh] = await sessionTickets(cfg, host, expires, auth.id);
+  const issued = now();
+  if (issued >= auth.expires || groups.get(key)?.deleted) return unavailable();
   return new Response(encodeFrame(WELCOME, 0), {
     headers: {
       ...noStore, 'Content-Type': 'application/octet-stream',
       'X-Carrier-Mode': 'websocket-lanes', 'X-Down-Cursor': '0',
-      'X-Session-Token': ticket, 'X-Session-TTL': String(expires - now()), 'X-Session-Renewal': refresh,
+      'X-Session-Token': ticket, 'X-Session-TTL': String(expires - issued), 'X-Session-Renewal': refresh,
     },
   });
 }
@@ -631,6 +635,8 @@ function advanceCounter(counter, blocks) {
 
 function createCTR(rawKey, counter) {
   const key = subtle.importKey('raw', rawKey, 'AES-CTR', false, ['encrypt']);
+  // A lane can close before using every key. The first use still sees a failed import.
+  void key.catch(() => {});
   const iv = new Uint8Array(counter);
   const start = new Uint8Array(16);
   const tail = new Uint8Array(16);
@@ -1053,6 +1059,7 @@ class Lane {
     this.release = options.release ?? (() => { group.active--; });
     this.openMs = options.openMs ?? 12000;
     this.stallMs = options.stallMs ?? 30000;
+    this.expiresAt = group.expires === undefined ? Infinity : group.expires * 1000;
     this.openedAt = Date.now();
     this.firstUpstream = false;
     this.firstForwarded = false;
@@ -1072,8 +1079,8 @@ class Lane {
     socket.addEventListener('error', this.onError);
     socket.accept();
     this.openTimer = setTimeout(() => this.stop('stream-timeout'), this.openMs);
-    if (this.group.expires !== undefined) {
-      this.expiryTimer = setTimeout(() => this.stop('session-expired'), Math.max(0, this.group.expires * 1000 - Date.now()));
+    if (this.expiresAt !== Infinity) {
+      this.expiryTimer = setTimeout(() => this.stop('session-expired'), Math.max(0, this.expiresAt - Date.now()));
     }
   }
 
@@ -1082,6 +1089,7 @@ class Lane {
   assertLive() {
     if (this.ended) throw new LaneFault('normal');
     if (this.group.deleted) throw new LaneFault('revoked');
+    if (this.expiresAt !== Infinity && Date.now() >= this.expiresAt) throw new LaneFault('session-expired');
   }
 
   assertSocket(socket) {
@@ -1576,6 +1584,7 @@ class Lane {
     clearTimeout(this.expiryTimer);
     clearTimeout(this.packetTimer);
     clearTimeout(this.nativeTimer);
+    this.openTimer = this.expiryTimer = this.packetTimer = this.nativeTimer = null;
     this.budget.release(this.nativeBytes[0] + this.nativeBytes[1]);
     this.nativeBytes.fill(0);
     this.controller.abort();
@@ -1596,11 +1605,13 @@ class Lane {
       peer.removeEventListener('error', this.onPeerError);
     }
     this.release();
-    const expired = kind === 'session-expired';
-    if (notify && !expired && socket.readyState === 1 && !congested(socket, 8)) {
+    const parentInvalid = kind === 'session-expired' || kind === 'revoked';
+    // These close codes carry parent or policy status. A preceding lane CLOSE
+    // would make the Bridge detach before it receives the WebSocket close.
+    if (notify && !parentInvalid && kind !== 'frame' && socket.readyState === 1 && !congested(socket, 8)) {
       try { socket.send(encodeFrame(CLOSE, this.sid)); } catch {}
     }
-    safeClose(socket, expired ? SESSION_EXPIRED_CLOSE : kind === 'frame' ? 1008 : kind === 'queue' ? 1013 : 1000);
+    safeClose(socket, parentInvalid ? SESSION_EXPIRED_CLOSE : kind === 'frame' ? 1008 : kind === 'queue' ? 1013 : 1000);
     safeClose(peer);
   }
 }
@@ -1612,10 +1623,11 @@ function runBridge(origin, fast, bootstrap) {
   const tokenPattern = /^[A-Za-z0-9_-]{43}$/;
   const lanes = new Map(), used = new Set();
   const lifetime = new AbortController();
+  const rejected = Symbol();
   const fragment = /^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash)?.[1];
   try { history.replaceState(null, '', location.pathname); } catch {}
-  let port, started = false, ready = false, closed = false, status;
-  let startupDeadline = 0;
+  let port, started = false, ready = false, closed = false, failing = false, status;
+  let startupDeadline = 0, startupTimer;
   let ticket = '', grant = '', until = 0, renewal;
   let pendingBytes = 0, pendingItems = 0;
   let trafficTimer = null, sentBytes = 0, receivedBytes = 0;
@@ -1663,39 +1675,60 @@ function runBridge(origin, fast, bootstrap) {
     pendingBytes -= lane.bytes;
     pendingItems -= lane.queue.length - lane.head;
     lane.queue.length = lane.bytes = lane.head = 0;
-    try { lane.socket?.close(); } catch {}
+    const ws = lane.socket;
+    lane.socket = null;
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = null;
+      if (ws.readyState < 2) {
+        try { ws.close(); } catch {}
+      }
+    }
     if (notify && !closed) {
       const frame = new ArrayBuffer(8);
       new DataView(frame).setUint32(0, 3 * 0x1000000 + lane.id);
-      port.postMessage(frame, [frame]);
+      try { port.postMessage(frame, [frame]); } catch { fail(); }
     }
+  }
+
+  function laneFailed(lane) {
+    if (closed || lane.done) return;
+    const lastStartupLane = startupDeadline && lanes.size === 1;
+    finish(lane, !lastStartupLane);
+    if (lastStartupLane) fail();
   }
 
   function shutdown() {
     if (closed) return;
     closed = true;
     lifetime.abort();
+    clearTimeout(startupTimer);
     clearTimeout(trafficTimer);
     for (const lane of lanes.values()) finish(lane, false);
-    port?.close();
+    used.clear();
+    try { port?.close(); } catch {}
     if (ticket && performance.now() < until) {
-      fetch(origin + '/api/v1/session', {
-        method: 'DELETE', keepalive: true, mode: 'same-origin', credentials: 'omit',
-        redirect: 'error', cache: 'no-store', referrerPolicy: 'no-referrer',
-        headers: { Authorization: 'Bearer ' + ticket },
-      }).catch(() => {});
+      try {
+        fetch(origin + '/api/v1/session', {
+          method: 'DELETE', keepalive: true, mode: 'same-origin', credentials: 'omit',
+          redirect: 'error', cache: 'no-store', referrerPolicy: 'no-referrer',
+          headers: { Authorization: 'Bearer ' + ticket },
+        }).catch(() => {});
+      } catch {}
     }
     ticket = grant = '';
   }
 
   function fail() {
-    if (closed) return;
-    try {
-      report('failed');
-      port.postMessage({ t: 'close' });
-    } finally {
-      shutdown();
-    }
+    if (closed || failing) return;
+    failing = true;
+    try { report('failed'); } catch {}
+    try { port?.postMessage({ t: 'close' }); } catch {}
+    shutdown();
+  }
+
+  function parentFailed() {
+    until = 0;
+    fail();
   }
 
   async function request(path, auth, body, code) {
@@ -1720,7 +1753,9 @@ function runBridge(origin, fast, bootstrap) {
           if (!control.signal.aborted && performance.now() <= deadline) return { response, welcome };
         }
         response.body?.cancel().catch(() => {});
-        if (!control.signal.aborted && response.status !== 503) return null;
+        if (!control.signal.aborted && response.status !== 503) {
+          return response.status >= 500 || response.status === 408 || response.status === 429 ? null : rejected;
+        }
         const seconds = response.headers.get('Retry-After');
         if (response.status === 503 && /^\d+$/.test(seconds ?? '')) retryAfter = Number(seconds) * 1000;
       } catch {
@@ -1757,8 +1792,11 @@ function runBridge(origin, fast, bootstrap) {
     // All lanes opened together share a renewal, while established lanes continue.
     renewal ??= (async () => {
       const result = await request('/api/v1/session/renew', grant, undefined, 204);
-      if (!result || closed) throw Error();
-      updateTicket(result.response.headers.get('X-Session-Token'), Number(result.response.headers.get('X-Session-TTL')));
+      if (closed || !result) return null;
+      if (result === rejected) { parentFailed(); return null; }
+      try {
+        updateTicket(result.response.headers.get('X-Session-Token'), Number(result.response.headers.get('X-Session-TTL')));
+      } catch { parentFailed(); return null; }
       return ticket;
     })().finally(() => { renewal = null; });
     return renewal;
@@ -1819,20 +1857,27 @@ function runBridge(origin, fast, bootstrap) {
     try {
       const auth = until - performance.now() > 10000 ? ticket : await currentTicket();
       if (closed || lane.done) return;
+      if (!auth) { laneFailed(lane); return; }
       const remaining = startupDeadline ? startupDeadline - performance.now() : 8000;
       if (remaining <= 0) { fail(); return; }
+      const handshakeMs = Math.min(8000, remaining);
+      const handshakeDeadline = performance.now() + handshakeMs;
       const protocol = 'tproxy-lane-v1.' + auth + '.' + lane.id;
       const ws = lane.socket = new WebSocket(WS, protocol);
       ws.binaryType = 'arraybuffer';
       lane.handshake = setTimeout(() => {
-        if (!lane.done && lane.socket === ws && !lane.opened) fail();
-      }, Math.min(8000, remaining));
+        if (!lane.done && lane.socket === ws && !lane.opened) laneFailed(lane);
+      }, handshakeMs);
       ws.onopen = () => {
-        if (closed || lane.done || lane.socket !== ws) { ws.close(); return; }
+        if (closed || lane.done || lane.socket !== ws) return;
         if (ws.protocol !== protocol) { fail(); return; }
+        if (performance.now() >= handshakeDeadline) { laneFailed(lane); return; }
         clearTimeout(lane.handshake);
         lane.opened = true;
-        startupDeadline = 0;
+        if (startupDeadline) {
+          clearTimeout(startupTimer);
+          startupDeadline = 0;
+        }
         try { flush(lane); } catch { finish(lane, true); }
       };
       ws.onmessage = event => {
@@ -1856,15 +1901,12 @@ function runBridge(origin, fast, bootstrap) {
       };
       ws.onclose = event => {
         if (closed || lane.done || lane.socket !== ws) return;
-        // Absolute parent expiry invalidates all lanes, including idle ones.
-        if (event?.code === 4001) {
-          until = 0;
-          fail();
-        } else if (!lane.opened) fail();
-        else finish(lane, true);
+        if (event?.code === 4001) parentFailed();
+        else if (event?.code === 1008) fail();
+        else laneFailed(lane);
       };
     } catch {
-      if (!lane.done) fail();
+      laneFailed(lane);
     }
   }
 
@@ -1920,7 +1962,7 @@ function runBridge(origin, fast, bootstrap) {
         welcome = new Uint8Array([17, 0, 0, 0, 0, 0, 0, 0]).buffer;
       } else {
         const result = await request('/api/v1/session', bootstrap, first, 200);
-        if (!result || closed) { fail(); return; }
+        if (!result || result === rejected || closed) { fail(); return; }
         welcome = result.welcome;
         const { headers } = result.response;
         if (headers.get('X-Carrier-Mode') !== 'websocket-lanes' ||
@@ -1943,7 +1985,7 @@ function runBridge(origin, fast, bootstrap) {
     if (port || closed) return;
     port = next;
     port.onmessage = event => {
-      if (closed) return;
+      if (closed || failing) return;
       const data = event.data;
       try {
         if (data instanceof ArrayBuffer) {
@@ -1953,14 +1995,17 @@ function runBridge(origin, fast, bootstrap) {
                 hello.getUint32(4) !== 1 || hello.getUint8(8) !== 1) throw Error();
             started = true;
             startupDeadline = performance.now() + 30000;
+            startupTimer = setTimeout(fail, 30000);
             void create(data);
           } else if (ready) enqueue(data);
           else throw Error();
         } else if (data?.t === 'close') shutdown();
       } catch { fail(); }
     };
-    port.start();
-    report('connecting');
+    try {
+      port.start();
+      report('connecting');
+    } catch { fail(); }
   }
 
   addEventListener('message', event => {
@@ -1974,6 +2019,7 @@ function runBridge(origin, fast, bootstrap) {
         !supplied.port || supplied.origin !== event.origin) return;
     start(ports[0]);
   });
+  addEventListener('pagehide', shutdown, { once: true });
   const injected = globalThis.TelegramWebProxy;
   if (fragment && typeof injected?.postMessage === 'function') {
     const adapter = {
@@ -1999,10 +2045,14 @@ function runBridge(origin, fast, bootstrap) {
       adapter.onmessage?.({ data });
     };
     // Native clients expect the authenticated init before any status or data.
-    injected.postMessage(JSON.stringify({ t: 'tproxy-android-init', v: 1, nonce: fragment }));
-    start(adapter);
+    try {
+      injected.postMessage(JSON.stringify({ t: 'tproxy-android-init', v: 1, nonce: fragment }));
+      start(adapter);
+    } catch {
+      adapter.close();
+      shutdown();
+    }
   }
-  addEventListener('pagehide', shutdown, { once: true });
 }
 
 
@@ -2132,16 +2182,13 @@ ${diagnostics ? `document.getElementById('probe').addEventListener('click', asyn
 
 function portalDiagnostics(request) {
   const colo = request.cf?.colo ?? '';
-  const placement = request.headers.get('cf-placement') ?? '';
   const incoming = /^[A-Z]{3}$/.test(colo) ? colo : '未提供';
-  const workerPlacement = /^(?:local|remote)-[A-Z]{3}$/.test(placement) ? placement : '未提供';
   const rtt = clientRtt(request);
   const pageRtt = Number.isFinite(rtt) && rtt >= 0 ? rtt + ' ms' : '未提供';
 
   return '<details open><summary>当前实例诊断</summary>' +
-    '<p>机房和 RTT 对应本次网页请求。RTT 衡量客户端到 Cloudflare 的往返耗时。</p><dl>' +
+    '<p>机房和 RTT 来自本次管理页请求的 Cloudflare 元数据，反映该请求的接入位置与往返耗时。</p><dl>' +
     '<dt>接入机房（colo）</dt><dd>' + incoming + '</dd>' +
-    '<dt>Worker 放置（cf-placement）</dt><dd>' + workerPlacement + '</dd>' +
     '<dt>客户端到 Cloudflare RTT</dt><dd>' + pageRtt + '</dd></dl>' +
     '<p>以下采样来自本实例已接受或建连成功的代理连接。P95 按区间显示。</p><dl>' +
     '<dt>Bridge 配置与密钥准备</dt><dd>' + timingSummary(timings.bridgeConfig) + '</dd>' +
@@ -2157,7 +2204,8 @@ function portalDiagnostics(request) {
     '<p>计数仅覆盖处理本次页面请求的实例，实例重启时清零。</p><dl>' +
     Object.entries(counters).sort(([a], [b]) => a.localeCompare(b))
       .map(([kind, value]) => '<dt>' + kind + '</dt><dd>' + value + '</dd>').join('') +
-    '<dt>活动连接</dt><dd>' + activeLanes + '</dd><dt>应用缓冲字节数</dt><dd>' + queuedBytes + '</dd></dl></details>';
+    '<dt>活动连接</dt><dd>' + activeLanes + '</dd><dt>应用记账缓冲字节数</dt><dd>' + queuedBytes + '</dd></dl>' +
+    '<p>缓冲字节数为应用记账，实例总内存由 Cloudflare 运行时统计。</p></details>';
 }
 
 function publicHomeResponse(method) {

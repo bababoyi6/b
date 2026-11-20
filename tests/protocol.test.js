@@ -159,6 +159,27 @@ it('lets the first login retry after a temporary storage error', async () => {
 
 afterEach(() => vi.restoreAllMocks());
 
+it.each([15, 16, 17])('applies the p length boundary and expires admin cookies (%i)', async length => {
+  const origin = 'https://password-boundary.example.com';
+  const env = { p: 'a'.repeat(length) };
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(1_790_000_000_000);
+  const login = await worker.fetch(new Request(origin + '/admin', {
+    method: 'POST', headers: { Origin: origin, 'CF-Connecting-IP': '192.0.2.90' },
+    body: new URLSearchParams({ password: env.p }),
+  }), env);
+  if (length < 16) {
+    expect(login.status).toBe(404);
+    return;
+  }
+  expect(login.status).toBe(303);
+  const Cookie = login.headers.get('Set-Cookie').split(';', 1)[0];
+  const manage = async () => (await worker.fetch(new Request(origin + '/admin', { headers: { Cookie } }), env)).text();
+  clock.mockReturnValue(1_790_001_799_000);
+  expect(await manage()).toContain('tg://webproxy');
+  clock.mockReturnValue(1_790_001_800_000);
+  expect(await manage()).not.toContain('tg://webproxy');
+});
+
 it('shares password derivation per host and evicts a rejected crypto result', async () => {
   const derive = vi.spyOn(crypto.subtle, 'deriveBits');
   const config = { p: 'synthetic-concurrent-configuration' };
@@ -177,6 +198,20 @@ it('shares password derivation per host and evicts a rejected crypto result', as
   const replacement = await configuration(rotated, host);
   expect(replacement.secret).not.toBe(concurrent[0].secret);
   expect((await configuration(config, host)).secret).toBe(concurrent[0].secret);
+});
+
+it('rederives the same host-specific keys after cache eviction', async () => {
+  const env = { p: 'synthetic-cache-eviction' };
+  const host = 'evicted.example.com';
+  const before = await configuration(env, host);
+  for (let index = 0; index < 8; index++) await configuration(env, `new-${index}.example.com`);
+  const derive = vi.spyOn(crypto.subtle, 'deriveBits');
+  const restored = await configuration(env, host);
+  expect(restored).not.toBe(before);
+  expect(restored.secret).toBe(before.secret);
+  expect(derive.mock.calls.map(([algorithm]) => algorithm.name)).toEqual(['PBKDF2', 'HKDF', 'HKDF']);
+  expect(await configuration(env, host)).toBe(restored);
+  expect(derive).toHaveBeenCalledTimes(3);
 });
 
 describe('MTProto and WEB Proxy wire formats', () => {
@@ -230,6 +265,14 @@ describe('MTProto and WEB Proxy wire formats', () => {
     const carry = Uint8Array.of(0x7e, 0xff, 0xff, 0xff, 0xff);
     expect(advanceCounter(carry, 0x10002)).toBe(false);
     expect([...carry]).toEqual([0x7f, 0, 1, 0, 1]);
+  });
+
+  it('observes a failed prewarmed key import even before its first use', async () => {
+    const failed = new Error('synthetic key import failure');
+    vi.spyOn(crypto.subtle, 'importKey').mockRejectedValueOnce(failed);
+    const crypt = createCTR(new Uint8Array(32), new Uint8Array(16));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await expect(crypt(Uint8Array.of(1))).rejects.toBe(failed);
   });
 
   it.each([0xef, 0xee, 0xdd])('preserves mode 0x%s and signed DC, with valid framing', mode => {
@@ -315,7 +358,8 @@ describe('carrier authentication', () => {
     const details = await debug.text();
     expect(details).toContain('当前实例诊断');
     expect(details).toContain('接入机房（colo）</dt><dd>HKG');
-    expect(details).toContain('Worker 放置（cf-placement）</dt><dd>remote-NRT');
+    expect(details).not.toContain('remote-NRT');
+    expect(details).toContain('应用记账缓冲字节数');
     expect(details).toContain('客户端到 Cloudflare RTT</dt><dd>42 ms');
     expect(details).toContain('代理升级请求的入口 RTT');
     expect(details).toContain('Worker 到 KWS 建连');
@@ -463,6 +507,59 @@ describe('carrier authentication', () => {
     expect((await worker.fetch(authRequest('/api/v1/session/renew', grant), ENV)).status).toBe(404);
     clock.mockReturnValue(start + 13 * 3600_000);
     expect((await worker.fetch(authRequest('/api/v1/session/renew', grant), ENV)).status).toBe(404);
+  });
+
+  it('validates a grant in a fresh isolate and refuses it at the absolute parent deadline', async () => {
+    const start = 1_791_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    const boot = await bridgeBoot(worker);
+    const create = (instance, token) => instance.fetch(authRequest('/api/v1/session', token, HELLO), ENV);
+    const initial = await create(worker, boot);
+    expect(initial.status).toBe(200);
+    const grant = initial.headers.get('X-Session-Renewal');
+    const source = readFileSync(new URL('../telegram_webproxy.js', import.meta.url));
+    const url = 'data:text/javascript;base64,' + source.toString('base64');
+    const { default: fresh, configuration: cfg } = await import(/* @vite-ignore */ url + '#fresh-isolate');
+    const renew = () => fresh.fetch(authRequest('/api/v1/session/renew', grant), ENV);
+    const deadline = start + (120 + 12 * 3600) * 1000;
+    clock.mockReturnValue(deadline - 1000);
+    const last = await renew();
+    expect(last.status).toBe(204);
+    expect(last.headers.get('X-Session-TTL')).toBe('1');
+    const ticket = last.headers.get('X-Session-Token');
+    const keys = await cfg(ENV, HOST);
+    expect(await verifyToken(keys, HOST, 2, ticket)).toBeTruthy();
+    clock.mockReturnValue(deadline);
+    expect((await renew()).status).toBe(404);
+    expect(await verifyToken(keys, HOST, 2, ticket)).toBeNull();
+    clock.mockReturnValue(deadline + 1000);
+    expect((await renew()).status).toBe(404);
+    expect((await create(fresh, boot)).status).toBe(404);
+    const replacement = await create(fresh, await bridgeBoot(fresh));
+    expect(replacement.status).toBe(200);
+    expect(replacement.headers.get('X-Session-Renewal')).not.toBe(grant);
+  });
+
+  it('rejects a renewal whose ticket finishes signing after the parent expires', async () => {
+    const start = 1_792_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    const boot = await bridgeBoot(worker);
+    const session = await worker.fetch(authRequest('/api/v1/session', boot, HELLO), ENV);
+    expect(session.status).toBe(200);
+    const grant = session.headers.get('X-Session-Renewal');
+    const deadline = start + (120 + 12 * 3600) * 1000;
+    clock.mockReturnValue(deadline - 1000);
+    const nativeSign = crypto.subtle.sign.bind(crypto.subtle);
+    let signs = 0;
+    vi.spyOn(crypto.subtle, 'sign').mockImplementation(async (...args) => {
+      const signed = await nativeSign(...args);
+      if (++signs === 2) clock.mockReturnValue(deadline);
+      return signed;
+    });
+    const response = await worker.fetch(authRequest('/api/v1/session/renew', grant), ENV);
+    expect(signs).toBe(2);
+    expect(response.status).toBe(404);
+    expect(response.headers.has('X-Session-Token')).toBe(false);
   });
 
   it('bounds HELLO buffers and rejects cookies, incompatible origins, invalid bodies and query strings', async () => {

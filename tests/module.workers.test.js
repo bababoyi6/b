@@ -224,7 +224,7 @@ it('blocks new lanes after local DELETE and closes an existing lane at its next 
     expect((await open(ticket, 46)).status).toBe(404);
     const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
     socket.send(encodeFrame(1, 45));
-    expect((await closed).code).toBe(1000);
+    expect((await closed).code).toBe(4001);
   } finally {
     socket.close();
   }

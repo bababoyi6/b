@@ -4,7 +4,7 @@
 
 ## 部署到 Workers
 
-1. 从 Release 的 **Assets** 下载 `telegram_webproxy.js`。也可下载 `Workers.zip` 并解压得到同一文件。 [发布资产](https://github.com/bababoyi6/b/releases/latest)
+1. 从 Release 的 **Assets** 下载 `telegram_webproxy.js`。`Workers.zip` 是源码归档，解压可得同一文件。`SHA256SUMS.txt` 可用于校验。 [发布资产](https://github.com/bababoyi6/b/releases/latest)
 2. 在 Cloudflare Dashboard 打开 **Workers 和 Pages → 创建应用 → 从 Hello World! 开始**，创建并部署一个 Worker。选 **编辑代码**，全选替换入口代码为下载的 JS，再点 **部署**。Workers 新建界面的静态文件上传用于静态资产，部署这个 Module Worker 使用代码编辑器。 [Workers Dashboard](https://developers.cloudflare.com/workers/get-started/dashboard/) · [Static Assets](https://developers.cloudflare.com/workers/static-assets/)
 3. 在 Worker 的 **设置 → 变量和密钥** 添加小写的 `p`，类型选 **Secret**，填写至少 16 字符的独立密码并保存部署。 [Workers Secret](https://developers.cloudflare.com/workers/configuration/secrets/)
 4. 在 **设置 → 域和路由** 添加 **自定义域**。证书生效后打开 `https://你的域名/admin`，登录并复制 `tg://webproxy` 链接，然后在 Telegram 添加。 [Workers 自定义域](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
@@ -17,6 +17,10 @@
 
 从 v0.3.0 起，所有新代理连接和管理操作都要求有效的 `p`。使用历史种子的部署可以保留原种子以维持原链接，并改用 `/admin` 登录。
 
-[本版性能、认证与 cfnew 对照](./docs/cfnew-study.md) · [Workers 免费额度与先前验收](./docs/workers.md) · [历史 Pages 版本](https://github.com/bababoyi6/b/releases/tag/v0.1.0-pages.1) · [Pages 实验记录](./docs/pages.md)
+## 断线恢复
+
+新建 lane 出现普通网络失败时，已经工作的 lane 可以继续通信。Bridge 向 Telegram 报告失败的那条流，由客户端决定何时重建。父会话到期、确认被撤销或出现严重载体协议错误时，Bridge 会关闭全部相关 lane 并通知客户端重建父会话。若客户端没有恢复，可在 Telegram 中重新启用已添加的同一代理。Bridge 会清理失败流的队列，业务数据由客户端协议决定是否重新发送。
+
+[稳定性与安全验收](./docs/stability.md) · [Changelog](./CHANGELOG.md) · [此前性能和 cfnew 对照](./docs/cfnew-study.md) · [Workers 免费额度](./docs/workers.md) · [历史 Pages 版本](https://github.com/bababoyi6/b/releases/tag/v0.1.0-pages.1)
 
 按 [GPL-3.0](./LICENSE) 分发。
