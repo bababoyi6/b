@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createCipheriv } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import worker, {
   advanceCounter, configuration, createCTR, encodeFrame, issueToken, makeHead,
   packetSize, readHead, verifyBridge, verifyToken, visitFrames,
@@ -15,6 +16,10 @@ it('allows password setup and keeps portal sessions separate from stable proxy c
   }), bindings);
   const welcome = await (await worker.fetch(new Request(ORIGIN), env)).text();
   expect(welcome).toContain('<h1>Welcome to nginx!</h1>');
+  expect(welcome).toContain('default welcome page');
+  expect(welcome).toContain('href="https://nginx.org/"');
+  expect(welcome).toContain('href="https://nginx.com/"');
+  expect(welcome).toContain('Thank you for using nginx.');
   expect(welcome).not.toMatch(/tg:\/\/|PROXY_SEED|Telegram|\/admin|<form/);
   const admin = await worker.fetch(new Request(ORIGIN + '/admin'), env);
   expect(admin.headers.get('Referrer-Policy')).toBe('same-origin');
@@ -29,6 +34,7 @@ it('allows password setup and keeps portal sessions separate from stable proxy c
   const missingStorage = await login({ p: password });
   expect(missingStorage.status).toBe(503);
   expect(missingStorage.headers.get('Set-Cookie')).toBeNull();
+  expect(await missingStorage.text()).toContain('查看控制台部署步骤');
   expect((await login({ p: password, PROXY_SEED: 'broken' })).status).toBe(503);
 
   const signedIn = await login(env);
@@ -73,6 +79,27 @@ it('allows password setup and keeps portal sessions separate from stable proxy c
   const ip = '192.0.2.6';
   for (let i = 0; i < 8; i++) expect((await login(env, 'incorrect password', ORIGIN, ip)).status).toBe(401);
   expect((await login(env, password, ORIGIN, ip)).status).toBe(429);
+});
+
+it('signs in with only a password when the Worker source has been prepared for the dashboard', async () => {
+  const source = readFileSync(new URL('../telegram_webproxy.js', import.meta.url), 'utf8');
+  const prepared = source.replace("const dashboardSeed = '';", "const dashboardSeed = '" + ENV.PORTAL_KEY + "';");
+  expect(prepared).not.toBe(source);
+  const { default: dashboard, configuration: dashboardConfiguration } =
+    await import(/* @vite-ignore */ 'data:text/javascript;base64,' + Buffer.from(prepared).toString('base64'));
+  const p = 'dashboard-only-password';
+  const env = { p };
+  const login = await dashboard.fetch(new Request(ORIGIN + '/admin', {
+    method: 'POST', body: new URLSearchParams({ password: p }), headers: { Origin: ORIGIN },
+  }), env);
+  expect(login.status).toBe(303);
+  const cookie = login.headers.get('Set-Cookie').split(';', 1)[0];
+  const admin = await dashboard.fetch(new Request(ORIGIN + '/admin', { headers: { Cookie: cookie } }), env);
+  const body = await admin.text();
+  expect(body).toContain(PROXY_SECRET);
+  expect(body).not.toContain(ENV.PORTAL_KEY);
+  expect((await dashboardConfiguration({ p: 'rotated-dashboard-password' }, HOST)).secret).toBe(PROXY_SECRET);
+  expect((await dashboard.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), env)).status).toBe(200);
 });
 
 it('lets the first login retry after a temporary storage error', async () => {

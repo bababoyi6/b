@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>生成 Cloudflare 控制台部署版</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px/1.6 system-ui, sans-serif; }
+    body { max-width: 36rem; margin: 3rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.5rem; }
+    label { display: grid; gap: .35rem; margin-block: 1.25rem; }
+    button { font: inherit; padding: .4rem .8rem; }
+    details { margin-block: 1.25rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>生成 Cloudflare 控制台部署版</h1>
+    <label>下载的 telegram_webproxy.js
+      <input id="source" type="file" accept=".js">
+    </label>
+    <details>
+      <summary>更新已有的控制台部署版</summary>
+      <label>上次生成的 telegram_webproxy.dashboard.js
+        <input id="previous" type="file" accept=".js">
+      </label>
+      <p>选中上次生成的文件可以保留现有代理链接。</p>
+    </details>
+    <button type="button" id="generate">生成并下载 JS</button>
+    <p id="status" role="status"></p>
+    <p>生成的文件含私用密钥。请保存在本地，用于自己的 Worker。</p>
+  </main>
+  <script>
+    const source = document.getElementById('source');
+    const previous = document.getElementById('previous');
+    const button = document.getElementById('generate');
+    const status = document.getElementById('status');
+    const seedLine = /^const dashboardSeed = '([a-f0-9]{64}|)';/gm;
+
+    function readSeed(code) {
+      const matches = [...code.matchAll(seedLine)];
+      if (matches.length !== 1) throw new Error('选中的文件不是支持此功能的 Worker JS。');
+      return matches[0][1];
+    }
+
+    button.addEventListener('click', async () => {
+      if (!source.files[0]) {
+        status.textContent = '请先选择 telegram_webproxy.js。';
+        return;
+      }
+      button.disabled = true;
+      try {
+        const code = await source.files[0].text();
+        let seed = readSeed(code);
+        if (previous.files[0]) {
+          const previousSeed = readSeed(await previous.files[0].text());
+          if (!previousSeed) throw new Error('上次的文件中没有已生成的密钥。');
+          if (seed && seed !== previousSeed) throw new Error('两个文件的密钥不同。请选择新的仓库源码。');
+          seed = previousSeed;
+        }
+        seed ||= Array.from(crypto.getRandomValues(new Uint8Array(32)),
+          byte => byte.toString(16).padStart(2, '0')).join('');
+        const workerCode = code.replace(seedLine, "const dashboardSeed = '" + seed + "';");
+        const url = URL.createObjectURL(new Blob([workerCode], { type: 'text/javascript' }));
+        const download = document.createElement('a');
+        download.href = url;
+        download.download = 'telegram_webproxy.dashboard.js';
+        download.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        status.textContent = '把下载的 JS 内容粘贴到 Worker，部署后打开 /admin 登录。';
+      } catch (error) {
+        status.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

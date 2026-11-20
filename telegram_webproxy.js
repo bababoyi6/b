@@ -72,6 +72,8 @@ function canonicalHost(url) {
 
 const importMAC = key => subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
 const derivationSalt = textEncoder.encode('cf-tgproxy-portal-v1');
+// The offline setup tool fills this value in the private Dashboard copy.
+const dashboardSeed = '';
 let cachedConfig, storedSeed;
 
 export class ProxySeedStore {
@@ -110,6 +112,7 @@ async function configuration(env, host, initialize = false) {
       storedSeed = { id: storageId, seed };
     }
   }
+  seed ??= dashboardSeed;
   if (typeof seed !== 'string' || !accessCodePattern.test(seed)) return null;
   const key = seed.toLowerCase();
   if (cachedConfig?.seed === key && cachedConfig.host === host) return cachedConfig;
@@ -419,8 +422,8 @@ async function routePortal(request, env, url, host) {
       count('configuration-error');
       return null;
     });
-    if (!cfg && env.PROXY_SEED === undefined && env.PORTAL_KEY === undefined && !env.PROXY_STATE) {
-      return loginResponse(method, '后台存储尚未配置。请使用项目的 Cloudflare 部署配置。', 503);
+    if (!cfg && env.PROXY_SEED === undefined && env.PORTAL_KEY === undefined && !env.PROXY_STATE && !dashboardSeed) {
+      return loginResponse(method, '请换用生成后的控制台部署版 JS，或者通过 Wrangler 部署。', 503, true);
     }
     if (!cfg) return loginResponse(method, '页面暂时不可用。', 503);
     const token = random(32);
@@ -1883,10 +1886,14 @@ function portalDiagnostics(request) {
 }
 
 function publicHomeResponse(method) {
-  return publicPage(method, 'Welcome to nginx!', '<h1>Welcome to nginx!</h1>');
+  return publicPage(method, 'Welcome to nginx!', `<h1>Welcome to nginx!</h1>
+<p>This is the default welcome page. Further site configuration may be required.</p>
+<p>For documentation and community support, visit <a href="https://nginx.org/">nginx.org</a>.<br>
+Commercial support is available at <a href="https://nginx.com/">nginx.com</a>.</p>
+<p><em>Thank you for using nginx.</em></p>`);
 }
 
-function loginResponse(method, error = '', status = 200) {
+function loginResponse(method, error = '', status = 200, showSetup = false) {
   return publicPage(method, '站点管理', `<h1>站点管理</h1>
 <form action="${adminPath}" method="post">
   <label for="password">访问密码</label>
@@ -1894,6 +1901,7 @@ function loginResponse(method, error = '', status = 200) {
   <button type="submit">登录</button>
 </form>
 ${error ? '<p role="alert">' + error + '</p>' : ''}
+${showSetup ? '<p><a href="https://github.com/bababoyi6/b#控制台粘贴部署">查看控制台部署步骤</a></p>' : ''}
 <p><a href="/">返回首页</a></p>`, true, status);
 }
 
