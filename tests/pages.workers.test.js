@@ -1,7 +1,8 @@
 import { expect, it } from 'vitest';
-import worker, { encodeFrame } from '../dist/verified/_worker.js';
+import pages from '../dist/verified/_worker.js';
+import workers, { configuration, encodeFrame, issueToken } from '../dist/workers/verified/telegram_webproxy.js';
 
-it('runs the packaged Module Worker with only p and issues the established link and lane protocol', async () => {
+it.each([['Pages', pages], ['Workers', workers]])('runs packaged %s with only p and issues the established link and lane protocol', async (_, worker) => {
   const origin = 'https://dashboard.example.com';
   const env = { p: 'synthetic-dashboard-password' };
   const endpoint = origin + '/admin';
@@ -36,4 +37,27 @@ it('runs the packaged Module Worker with only p and issues the established link 
   socket.accept();
   socket.send(encodeFrame(1, 41));
   socket.close();
+});
+
+it('sends the private parent-expiration close code through workerd', async () => {
+  const host = 'expiry.example.com';
+  const env = { p: 'synthetic-dashboard-password' };
+  const cfg = await configuration(env, host);
+  const limit = Math.floor(Date.now() / 1000) + 2;
+  const id = crypto.getRandomValues(new Uint8Array(12));
+  new DataView(id.buffer).setUint32(0, limit);
+  const ticket = await issueToken(cfg, host, 2, limit, id);
+  const response = await workers.fetch(new Request('https://' + host + '/api/v1/ws', { headers: {
+    Upgrade: 'websocket', 'Sec-WebSocket-Protocol': 'tproxy-lane-v1.' + ticket + '.1',
+  } }), env);
+  expect(response.status).toBe(101);
+  const socket = response.webSocket;
+  try {
+    socket.accept();
+    const close = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
+    socket.send(encodeFrame(1, 1));
+    expect((await close).code).toBe(4001);
+  } finally {
+    socket.close();
+  }
 });

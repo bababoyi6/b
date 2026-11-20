@@ -263,6 +263,32 @@ async function cryptAfter(first, crypt) {
 }
 
 describe('carrier authentication', () => {
+  it('rejects malformed carrier headers before deriving the cold host key', async () => {
+    const cfg = await configuration(ENV, HOST);
+    const expires = Math.floor(Date.now() / 1000) + 60;
+    const boot = await issueToken(cfg, HOST, 1, expires, new Uint8Array(12));
+    const ticket = await issueToken(cfg, HOST, 2, expires, new Uint8Array(12));
+    const cold = 'https://cold-headers.example.com';
+    const env = { p: 'synthetic-cold-headers-password' };
+    const derive = vi.spyOn(crypto.subtle, 'deriveBits');
+    for (const request of [
+      new Request(cold + '/api/v1/session', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + boot, 'Content-Type': 'text/plain' }, body: HELLO,
+      }),
+      new Request(cold + '/api/v1/session', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + boot, 'Content-Type': 'application/octet-stream', 'Content-Length': '1000' }, body: HELLO,
+      }),
+      new Request(cold + '/api/v1/ws', {
+        headers: { Upgrade: 'websocket', 'Sec-WebSocket-Version': '12', 'Sec-WebSocket-Protocol': 'tproxy-lane-v1.' + ticket + '.1' },
+      }),
+    ]) {
+      const response = await worker.fetch(request, env);
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe('');
+    }
+    expect(derive).not.toHaveBeenCalled();
+  });
+
   it('protects the portal and separates it from Bridge authentication', async () => {
     const response = await worker.fetch(new Request(ORIGIN + '/' + ENV.PORTAL_KEY), ENV);
     const html = await response.text();

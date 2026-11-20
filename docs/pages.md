@@ -2,7 +2,7 @@
 
 ## 交付基线
 
-从远端 `codex/worker-relay-optimization` 的 `59aeb06b19ed24b90555ce3d88de668410e0ebb5` 开始。开始时远端 `main` 为 `9bae146`，两个分支均重新核对。正式 `Pages.zip` 由公开源码生成，根目录的唯一文件是 Advanced Mode Module Worker `_worker.js`。固定 ZIP 时间戳、UTF-8 编码和存储方式，构建时拒绝填入随机种子的私有 JS。验证器核对目录、CRC32、SHA-256 与源码。真实 workerd 直接加载从 ZIP 解出的文件。 [打包](../scripts/build-pages.mjs) · [验证](../scripts/verify-pages.mjs) · [发布工作流](../.github/workflows/pages-release.yml)
+从远端 `codex/worker-relay-optimization` 的 `59aeb06b19ed24b90555ce3d88de668410e0ebb5` 开始。开始时远端 `main` 为 `9bae146`，两个分支均重新核对。正式 `Pages.zip` 由公开源码生成，根目录的唯一文件是 Advanced Mode Module Worker `_worker.js`。固定 ZIP 时间戳、UTF-8 编码和存储方式，构建时拒绝填入随机种子的私有 JS。验证器核对目录、CRC32、SHA-256 与源码。真实 workerd 直接加载从 ZIP 解出的文件。 [打包](../scripts/build-package.mjs) · [验证](../scripts/verify-package.mjs) · [发布工作流](../.github/workflows/pages-release.yml)
 
 Pages 上线只需生产 Secret `p`。真实验证项目的 `/admin` 在首次部署、保存 `p` 后分别返回 404，重新部署后返回 200。登录、派生链接和 Worker WebSocket Upgrade 独立验收。Cloudflare 文档明确支持 Dashboard 拖放含 `_worker.js` 的 ZIP。实际验证项目在 Dashboard 创建，浏览器自动化的文件选择受权限限制，线上部署由 Wrangler 上传从 ZIP 解出的同一份模块完成。Dashboard 文件拖放的完整过程仍待实点确认。 [Direct Upload](https://developers.cloudflare.com/pages/get-started/direct-upload/) · [Advanced Mode](https://developers.cloudflare.com/pages/functions/advanced-mode/) · [Secret 生效](https://developers.cloudflare.com/pages/functions/bindings/#secrets)
 

@@ -30,9 +30,9 @@ it.each([
       sockets.push(this);
       queueMicrotask(() => { this.accept(); this.onopen?.(); });
     }
-    close() {
-      super.close();
-      this.onclose?.();
+    close(code = 1000) {
+      super.close(code);
+      this.onclose?.({ code });
     }
   }
   const injected = { postMessage(data) { messages.push(data); } };
@@ -84,6 +84,11 @@ it.each([
     sockets[0].close();
     expect(messages.some(value => value instanceof ArrayBuffer && new DataView(value).getUint32(0) === 0x03000001)).toBe(true);
     expect(sockets[1].readyState).toBe(1);
+    sockets[1].close(4001);
+    sockets[2].onclose({ code: 4001 });
+    expect(messages.filter(value => typeof value === 'string' && JSON.parse(value).t === 'close')).toHaveLength(1);
+    expect(calls.filter(([, options]) => options.method === 'DELETE')).toHaveLength(0);
+    expect(sockets[2].readyState).toBe(3);
   } finally {
     listeners.get('pagehide')();
   }

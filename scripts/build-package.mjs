@@ -3,15 +3,19 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { crc32 } from 'node:zlib';
 
 const source = readFileSync(new URL('../telegram_webproxy.js', import.meta.url), 'utf8').replaceAll('\r\n', '\n');
+const workers = process.argv.includes('--workers');
+const filename = workers ? 'telegram_webproxy.js' : '_worker.js';
+const archive = workers ? 'Workers.zip' : 'Pages.zip';
+const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 if (!/^const dashboardSeed = '';$/m.test(source) || !/^const passwordSetting = env => env\.p\b/m.test(source)) {
-  throw new Error('Pages must be built from the public source with the p Secret');
+  throw new Error('Build requires the public source with the p Secret');
 }
 if (/^\s*import\b/m.test(source) || !source.includes('export default')) {
   throw new Error('Expected a standalone Module Worker');
 }
 
 // ZIP with one stored file, UTF-8 flag, and fixed timestamp for reproducible releases.
-const name = Buffer.from('_worker.js');
+const name = Buffer.from(filename);
 const file = Buffer.from(source);
 const checksum = crc32(file);
 const local = Buffer.alloc(30);
@@ -36,9 +40,14 @@ end.writeUInt32LE(central.length + name.length, 12);
 end.writeUInt32LE(local.length + name.length + file.length, 16);
 const zip = Buffer.concat([local, name, file, central, name, end]);
 
-const output = new URL('../dist/', import.meta.url);
+const output = new URL(workers ? '../dist/workers/' : '../dist/', import.meta.url);
 mkdirSync(output, { recursive: true });
-const hash = createHash('sha256').update(zip).digest('hex');
-writeFileSync(new URL('Pages.zip', output), zip);
-writeFileSync(new URL('SHA256SUMS.txt', output), hash + '  Pages.zip\n');
-console.log(hash + '  Pages.zip');
+const hash = digest(zip);
+writeFileSync(new URL(archive, output), zip);
+let checksums = hash + '  ' + archive + '\n';
+if (workers) {
+  writeFileSync(new URL(filename, output), file);
+  checksums += digest(file) + '  ' + filename + '\n';
+}
+writeFileSync(new URL('SHA256SUMS.txt', output), checksums);
+console.log(checksums.trimEnd());

@@ -3,7 +3,7 @@ name: Transport benchmark
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ['v*', '!v*-workers']
     paths: [telegram_webproxy.js, 'benchmarks/**', 'experiments/tcp.mjs', tests/fixtures.js]
   pull_request:
     paths: [telegram_webproxy.js, 'benchmarks/**', 'experiments/tcp.mjs', tests/fixtures.js]

@@ -339,10 +339,30 @@ it('releases an idle lane when the parent session expires', async () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(lane.ended).toBe(true);
     expect(client.readyState).toBe(3);
+    expect(client.code).toBe(4001);
     expect(group.active).toBe(0);
     expect(group.bytes).toBe(0);
   } finally {
     client.close();
     vi.useRealTimers();
   }
+});
+
+it('releases the upstream data charge before a congested downstream send', async () => {
+  const fixture = transportFixture();
+  const peer = new FakeSocket();
+  const { lane, group, client } = laneOf(1, fixture, async () => peer);
+  const payload = Buffer.alloc(256 * 1024, 3);
+  try {
+    client.receive(encodeFrame(2, 1, fixture.wire));
+    await until(() => peer.sent.length === 1 && !lane.upBusy);
+    client.bufferedAmount = 2 * 1024 * 1024;
+    const drain = vi.spyOn(lane, 'drain');
+    peer.receive(headers(peer, 0xdd, -2).reverse.update(payload));
+    await until(() => drain.mock.calls.length === 1);
+    expect(group.bytes).toBe(4 * (payload.length + 32));
+  } finally {
+    client.close();
+  }
+  await until(() => group.bytes === 0);
 });

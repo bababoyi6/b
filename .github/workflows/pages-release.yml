@@ -3,7 +3,7 @@ name: Pages package
 on:
   pull_request:
   push:
-    tags: ['v*']
+    tags: ['v*-pages.*']
   workflow_dispatch:
 
 permissions:

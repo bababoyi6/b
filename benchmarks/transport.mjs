@@ -28,6 +28,11 @@ const workloads = [
   ['持续下载', [[128, 131068, 8, 'down']]],
   ['持续上传', [[64, 524284, 4, 'up']]],
 ];
+if (process.argv.includes('--sizes')) {
+  for (const size of [1024, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024]) {
+    workloads.push([size / 1024 + ' KiB 下载', [[64, size - 4, size >= 1024 * 1024 ? 2 : 8, 'down']]]);
+  }
+}
 
 class Socket extends FakeSocket {
   sentBytes = 0;
@@ -83,7 +88,7 @@ function openFixture() {
 }
 
 async function start(version, id, [count, size, burst, direction]) {
-  const directTCP = version === 'tcp';
+  const directTCP = version === 'tcp' || version === 'upstream-tcp';
   const fixture = transportFixture(0xdd, id);
   const client = new Socket();
   let peer, current;
@@ -104,7 +109,7 @@ async function start(version, id, [count, size, burst, direction]) {
     mkSession({ secret: fixture.secret, sid: id }).attach(client);
   } else {
     peer = directTCP ? new TCPSocket() : new Socket();
-    const Relay = version === 'upstream' ? BaselineLane : Lane;
+    const Relay = version.startsWith('upstream') ? BaselineLane : Lane;
     const dial = directTCP ? createTCPEngine(() => peer) : async () => peer;
     current = new Relay(client, id, fixture.secret, syntheticGroup(), dial, { directTCP });
     current.attach();
@@ -198,7 +203,7 @@ async function measure(version, spec) {
       cpuMs: (cpu.user + cpu.system) / 1000, p50Ms: percentile(.50), p95Ms: percentile(.95),
       peakBuffersMiB: (peak - before) / (1024 * 1024), cryptoCalls: cryptoStats.calls,
       cryptoOutputMiB: cryptoStats.output / (1024 * 1024),
-      [version === 'tcp' ? 'tcpWrites' : 'kwsSends']: lanes.reduce((n, lane) => n + lane.peer.sends - 1, 0),
+      [version.endsWith('tcp') ? 'tcpWrites' : 'kwsSends']: lanes.reduce((n, lane) => n + lane.peer.sends - 1, 0),
       workerSends: lanes.reduce((n, lane) => n + lane.client.sends - 1, 0),
     };
   } finally {
@@ -210,7 +215,10 @@ async function measure(version, spec) {
 
 const rounds = process.argv.includes('--quick') ? 3 : 7;
 const variants = baseline ? ['upstream', 'candidate'] : ['candidate'];
-if (process.argv.includes('--tcp')) variants.push('tcp');
+if (process.argv.includes('--tcp')) {
+  if (BaselineLane && process.argv.includes('--tcp-baseline')) variants.push('upstream-tcp');
+  variants.push('tcp');
+}
 console.log(JSON.stringify({ node: process.version, platform: process.platform, cpus: availableParallelism(), rounds, baseline }));
 for (const [name, spec] of workloads) {
   const results = Object.fromEntries(variants.map(variant => [variant, []]));

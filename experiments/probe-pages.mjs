@@ -4,7 +4,9 @@ import { readFileSync } from 'node:fs';
 import { encodeFrame, makeHead, visitFrames } from '../telegram_webproxy.js';
 import { independentCTR, packet } from '../tests/fixtures.js';
 
-const [passwordFile, ...targets] = process.argv.slice(2);
+const [passwordFile, ...options] = process.argv.slice(2);
+const includeMedia = options.includes('--media');
+const targets = options.filter(arg => arg !== '--media');
 if (!passwordFile || !targets.length) throw new Error('Usage: node experiments/probe-pages.mjs <test-password-file> <https-url> [...]');
 const password = readFileSync(passwordFile, 'utf8').trimEnd();
 assert.ok(password.length >= 16);
@@ -37,7 +39,7 @@ function makeRequest() {
   return { nonce, request: packet(request, 0xee) };
 }
 
-async function probe({ origin, challenge, secret }, dc) {
+async function probe({ origin, challenge, secret }, dc, media) {
   const started = performance.now();
   const time = () => Math.round(performance.now() - started);
   const get = await fetch(origin + '/?bridge=' + challenge, { signal: AbortSignal.timeout(10000) });
@@ -48,7 +50,7 @@ async function probe({ origin, challenge, secret }, dc) {
   const ticket = /"ticket":"([A-Za-z0-9_-]{43})"/.exec(await get.text())?.[1];
   if (!ticket) throw new Error('ticket');
   const bridge = time();
-  const head = makeHead({ dc, mode: 0xee, media: false });
+  const head = makeHead({ dc, mode: 0xee, media });
   const cipher = independentCTR(head, secret);
   const reverse = independentCTR(head, secret, true);
   const { nonce, request } = makeRequest();
@@ -98,7 +100,7 @@ const deployments = [];
 for (const target of targets) {
   const url = new URL(target);
   assert.equal(url.protocol, 'https:');
-  assert.ok(url.hostname.endsWith('.pages.dev') && url.pathname === '/' && !url.search && !url.hash);
+  assert.ok(/\.(?:pages|workers)\.dev$/.test(url.hostname) && url.pathname === '/' && !url.search && !url.hash);
   const secret = proxySecret(url.hostname);
   const challenge = createHmac('sha256', secret).update('tdesktop-web-proxy-bridge-v1\n' + url.hostname).digest('base64url');
   await checkAdmin(url.origin, secret);
@@ -108,11 +110,13 @@ for (const target of targets) {
 const results = new Map(deployments.map(({ origin }) => [origin, []]));
 for (let round = 0; round < 3; round++) {
   for (let dc = 1; dc <= 5; dc++) {
-    for (const deployment of round % 2 ? [...deployments].reverse() : deployments) {
-      let sample;
-      try { sample = { dc, ...await probe(deployment, dc) }; }
-      catch (error) { sample = { dc, failure: error.message }; }
-      results.get(deployment.origin).push(sample);
+    for (const media of includeMedia ? [false, true] : [false]) {
+      for (const deployment of round % 2 ? [...deployments].reverse() : deployments) {
+        let sample;
+        try { sample = { dc, media, ...await probe(deployment, dc, media) }; }
+        catch (error) { sample = { dc, media, failure: error.message }; }
+        results.get(deployment.origin).push(sample);
+      }
     }
   }
 }

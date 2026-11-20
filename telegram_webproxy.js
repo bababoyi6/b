@@ -19,6 +19,7 @@ const BOOTSTRAP = 1, SESSION = 2, RENEWAL = 3, PORTAL_SESSION = 4;
 const BOOT_LIFETIME = 120, TICKET_LIFETIME = 300, GRANT_LIFETIME = 12 * 3600;
 const FAST_TICKET_LIFETIME = 90, PORTAL_LIFETIME = 30 * 60;
 const MAX_SID = 0xffffff;
+const SESSION_EXPIRED_CLOSE = 4001;
 const EMPTY = new Uint8Array(0);
 const textEncoder = new TextEncoder();
 const subtle = crypto.subtle;
@@ -516,6 +517,11 @@ async function route(request, env, dial, directTCP) {
   const renewal = api && path === '/api/v1/session/renew' && method === 'POST';
   const upgrade = api && path === '/api/v1/ws' && method === 'GET' &&
     headers.get('Upgrade')?.toLowerCase() === 'websocket' && parseLaneProtocol(headers);
+  if (renewal || (session && method === 'POST')) {
+    const length = headers.get('Content-Length');
+    if (length !== null && length !== String(renewal ? 0 : helloFrame.length)) return unavailable();
+    if (session && headers.get('Content-Type')?.trim().toLowerCase() !== 'application/octet-stream') return unavailable();
+  }
   const token = (session || renewal) && !headers.has('Cookie') ? bearer(request) : null;
   const purpose = upgrade || method === 'DELETE' ? SESSION : renewal ? RENEWAL : BOOTSTRAP;
   const claims = decodeLiveToken(purpose, upgrade ? upgrade.token : token);
@@ -569,8 +575,7 @@ async function route(request, env, dial, directTCP) {
       ...noStore, 'X-Session-Token': ticket, 'X-Session-TTL': String(expires - now()),
     } });
   }
-  if (headers.get('Content-Type')?.trim().toLowerCase() !== 'application/octet-stream' ||
-      !(await readExactBody(request, helloFrame)) || now() >= auth.expires || groups.get(key)?.deleted) return unavailable();
+  if (!(await readExactBody(request, helloFrame)) || now() >= auth.expires || groups.get(key)?.deleted) return unavailable();
   // Byte-identical creation retries get the same tickets in every isolate.
   const expires = auth.expires - BOOT_LIFETIME + TICKET_LIFETIME;
   const [ticket, refresh] = await sessionTickets(cfg, host, expires, auth.id);
@@ -584,6 +589,8 @@ async function route(request, env, dial, directTCP) {
 }
 
 function parseLaneProtocol(headers) {
+  const version = headers.get('Sec-WebSocket-Version');
+  if (version !== null && version !== '13') return null;
   const protocol = headers.get('Sec-WebSocket-Protocol');
   const match = /^tproxy-lane-v1\.([A-Za-z0-9_-]{43})\.([1-9][0-9]{0,7})$/.exec(protocol ?? '');
   if (!match || Number(match[2]) > MAX_SID) return null;
@@ -1210,6 +1217,7 @@ class Lane {
   }
 
   async readTCP(peer) {
+    let readSize = DOWN_FRAME;
     try {
       while (!this.ended) {
         if (!this.sending) await this.waitForCredit();
@@ -1217,7 +1225,7 @@ class Lane {
           await this.drain(this.socket, Math.min(DOWN_FRAME, this.sending) + 8);
         }
         // A BYOB read can neither exceed credit nor allocate an unbounded chunk.
-        const size = Math.min(this.sending, DOWN_FRAME);
+        const size = Math.min(this.sending, readSize);
         this.budget.hold(size);
         try {
           const { done, value } = await peer.read(size);
@@ -1225,6 +1233,10 @@ class Lane {
           if (done) {
             this.stop('tcp-close');
             return;
+          }
+          // Increase capacity only when the reader uses the entire buffer.
+          if (size === readSize) {
+            readSize = value.byteLength === size ? Math.min(CRYPT_CHUNK, size * 2) : Math.max(DOWN_FRAME, size / 2);
           }
           await this.enqueueDown(value);
         } finally {
@@ -1437,6 +1449,8 @@ class Lane {
               bytes.set(item.data, offset);
               offset += item.data.length;
             }
+            for (const item of batch) this.releaseDown(item);
+            batch.length = 0;
           }
           for (let offset = 0; offset < length;) {
             if (!this.sending) await this.waitForCredit();
@@ -1445,6 +1459,17 @@ class Lane {
             this.budget.hold(reserve);
             try {
               const plain = await this.peerRead(bytes.subarray(offset, offset + size));
+              if (offset + size === length) {
+                // Sending may wait on the client. The upstream ciphertext is
+                // no longer referenced by WebCrypto or by the send queue.
+                bytes = null;
+                if (copy) {
+                  this.budget.release(copy);
+                  copy = 0;
+                } else {
+                  this.releaseDown(batch.pop());
+                }
+              }
               this.assertLive();
               const wire = await this.clientWrite(plain);
               for (let pos = 0; pos < wire.length;) {
@@ -1558,10 +1583,11 @@ class Lane {
       peer.removeEventListener('error', this.onPeerError);
     }
     this.release();
-    if (notify && socket.readyState === 1 && !congested(socket, 8)) {
+    const expired = kind === 'session-expired';
+    if (notify && !expired && socket.readyState === 1 && !congested(socket, 8)) {
       try { socket.send(encodeFrame(CLOSE, this.sid)); } catch {}
     }
-    safeClose(socket, kind === 'frame' ? 1008 : kind === 'queue' ? 1013 : 1000);
+    safeClose(socket, expired ? SESSION_EXPIRED_CLOSE : kind === 'frame' ? 1008 : kind === 'queue' ? 1013 : 1000);
     safeClose(peer);
   }
 }
@@ -1815,9 +1841,13 @@ function runBridge(origin, fast, bootstrap) {
           if (ended) finish(lane, false);
         } catch { fail(); }
       };
-      ws.onclose = () => {
+      ws.onclose = event => {
         if (closed || lane.done || lane.socket !== ws) return;
-        if (!lane.opened) fail();
+        // Absolute parent expiry invalidates all lanes, including idle ones.
+        if (event?.code === 4001) {
+          until = 0;
+          fail();
+        } else if (!lane.opened) fail();
         else finish(lane, true);
       };
     } catch {
