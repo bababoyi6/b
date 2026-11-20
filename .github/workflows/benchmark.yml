@@ -3,10 +3,10 @@ name: Transport benchmark
 on:
   push:
     branches: [main]
-    tags: ['v*']
-    paths: [telegram_webproxy.js, 'benchmarks/**']
+    tags: ['v*', '!v*-workers']
+    paths: [telegram_webproxy.js, 'benchmarks/**', 'experiments/tcp.mjs', tests/fixtures.js]
   pull_request:
-    paths: [telegram_webproxy.js, 'benchmarks/**']
+    paths: [telegram_webproxy.js, 'benchmarks/**', 'experiments/tcp.mjs', tests/fixtures.js]
   workflow_dispatch:
 
 permissions:
@@ -16,6 +16,8 @@ jobs:
   compare:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      BENCHMARK_BASELINE: b5835145b157f22691b671470856d0d37f07316e
     steps:
       - uses: actions/checkout@v6
         with:
@@ -24,6 +26,10 @@ jobs:
         with:
           node-version: '24'
       - if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
-        run: npm run bench
+        run: |
+          node --expose-gc benchmarks/transport.mjs --tcp --against="$BENCHMARK_BASELINE"
+          node benchmarks/startup.mjs --against="$BENCHMARK_BASELINE"
       - if: github.event_name != 'workflow_dispatch' && github.ref_type != 'tag'
-        run: npm run bench -- --quick
+        run: |
+          node --expose-gc benchmarks/transport.mjs --quick --tcp --against="$BENCHMARK_BASELINE"
+          node benchmarks/startup.mjs --quick --against="$BENCHMARK_BASELINE"

@@ -3,7 +3,7 @@ name: Worker regression
 on:
   push:
     branches: [main]
-    tags: ['v*']
+    tags: ['v*', '!v*-workers']
   pull_request:
   workflow_dispatch:
 

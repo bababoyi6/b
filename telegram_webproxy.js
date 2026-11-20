@@ -4,7 +4,7 @@ const KiB = 1024;
 const MiB = 1024 * KiB;
 const WINDOW = 4 * MiB;
 const DOWN_FRAME = 64 * KiB;
-const DOWN_CRYPT = 512 * KiB;
+const CRYPT_CHUNK = 512 * KiB;
 const SOCKET_BUFFER = 2 * MiB;
 const MAX_MESSAGE = 2 * MiB;
 const MAX_FRAME = MiB;
@@ -19,6 +19,7 @@ const BOOTSTRAP = 1, SESSION = 2, RENEWAL = 3, PORTAL_SESSION = 4;
 const BOOT_LIFETIME = 120, TICKET_LIFETIME = 300, GRANT_LIFETIME = 12 * 3600;
 const FAST_TICKET_LIFETIME = 90, PORTAL_LIFETIME = 30 * 60;
 const MAX_SID = 0xffffff;
+const SESSION_EXPIRED_CLOSE = 4001;
 const EMPTY = new Uint8Array(0);
 const textEncoder = new TextEncoder();
 const subtle = crypto.subtle;
@@ -40,12 +41,13 @@ const hex = value => Uint8Array.from(value.match(/../g), pair => Number.parseInt
 const b64 = bytes => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
 const binary = value => value instanceof ArrayBuffer ? new Uint8Array(value) : value;
 const tokenPattern = /^[A-Za-z0-9_-]{43}$/;
+// A canonical 32-byte base64url token has two zero padding bits.
+const canonicalTokenPattern = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 const accessCodePattern = /^[0-9a-f]{64}$/i;
 
 function decodeToken(value) {
-  if (typeof value !== 'string' || !tokenPattern.test(value)) return null;
-  const bytes = Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='), c => c.charCodeAt(0));
-  return b64(bytes) === value ? bytes : null;
+  if (typeof value !== 'string' || !canonicalTokenPattern.test(value)) return null;
+  return Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='), c => c.charCodeAt(0));
 }
 
 function equalBytes(a, b) {
@@ -74,23 +76,18 @@ const importMAC = key => subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA
 const derivationSalt = textEncoder.encode('cf-tgproxy-portal-v1');
 // The offline setup tool fills this value in the private Dashboard copy.
 const dashboardSeed = '';
-let cachedConfig, storedSeed, passwordSeed;
+const configurations = new Map();
+const MAX_CONFIGURATIONS = 8;
+let storedSeed;
 
-async function derivePasswordSeed(env, host) {
-  const value = passwordSetting(env);
-  if (passwordSeed && passwordSeed.value === value && passwordSeed.host === host) return passwordSeed.seed;
-  const password = portalPassword(env);
-  if (!password) return null;
+async function derivePasswordSeed(password, host) {
   const key = await subtle.importKey('raw', password, 'PBKDF2', false, ['deriveBits']);
-  const bits = await subtle.deriveBits({
+  return subtle.deriveBits({
     name: 'PBKDF2',
     hash: 'SHA-256',
     salt: textEncoder.encode('cf-tgproxy-dashboard-v1\0' + host),
     iterations: 16000,
   }, key, 256);
-  const seed = hexString(new Uint8Array(bits));
-  passwordSeed = { value, host, seed };
-  return seed;
 }
 
 export class ProxySeedStore {
@@ -112,7 +109,7 @@ export class ProxySeedStore {
   }
 }
 
-async function configuration(env, host, initialize = false) {
+async function configuration(env, host, initialize = false, password = portalPassword(env)) {
   let seed = env.PROXY_SEED ?? env.PORTAL_KEY;
   const store = env.PROXY_STATE;
   if (seed === undefined && store) {
@@ -130,13 +127,35 @@ async function configuration(env, host, initialize = false) {
     }
   }
   // Persisted and manually prepared seeds take precedence over password-only setup.
-  seed ??= dashboardSeed || await derivePasswordSeed(env, host);
-  if (typeof seed !== 'string' || !accessCodePattern.test(seed)) return null;
-  const key = seed.toLowerCase();
-  if (cachedConfig?.seed === key && cachedConfig.host === host) return cachedConfig;
+  seed ??= dashboardSeed || undefined;
+  const fromPassword = seed === undefined;
+  if (!fromPassword && (typeof seed !== 'string' || !accessCodePattern.test(seed))) return null;
+  const source = fromPassword ? env.p : seed.toLowerCase();
+  const cached = configurations.get(host);
+  if (cached?.source === source && cached?.fromPassword === fromPassword) {
+    configurations.delete(host);
+    configurations.set(host, cached);
+    return cached.result;
+  }
+  // Only pure WebCrypto work is shared. The legacy binding fetch above
+  // stays in the invocation that owns the I/O.
+  if (fromPassword && !password) return null;
+  const result = deriveConfiguration(host, fromPassword ? password : null, source);
+  const entry = { source, fromPassword, result };
+  configurations.delete(host);
+  configurations.set(host, entry);
+  if (configurations.size > MAX_CONFIGURATIONS) configurations.delete(configurations.keys().next().value);
+  try {
+    return await result;
+  } catch (error) {
+    if (configurations.get(host) === entry) configurations.delete(host);
+    throw error;
+  }
+}
 
-  const portalBytes = hex(key);
-  const masterKey = await subtle.importKey('raw', portalBytes, 'HKDF', false, ['deriveBits']);
+async function deriveConfiguration(host, password, source) {
+  const seed = password ? await derivePasswordSeed(password, host) : hex(source);
+  const masterKey = await subtle.importKey('raw', seed, 'HKDF', false, ['deriveBits']);
   const derive = (purpose, length) => subtle.deriveBits({
     name: 'HKDF',
     hash: 'SHA-256',
@@ -149,9 +168,7 @@ async function configuration(env, host, initialize = false) {
   ]);
   const proxyKey = new Uint8Array(proxyBits);
   const [bridgeKey, carrierKey] = await Promise.all([importMAC(proxyKey), importMAC(carrierBits)]);
-  const secret = hexString(proxyKey);
-  cachedConfig = { seed: key, host, secret, proxyKey, bridgeKey, carrierKey };
-  return cachedConfig;
+  return { secret: hexString(proxyKey), proxyKey, bridgeKey, carrierKey };
 }
 
 async function verifyBridge(bridgeKey, host, capability) {
@@ -174,16 +191,26 @@ async function issueToken(cfg, host, purpose, expires, id) {
   return b64(bytes);
 }
 
-async function verifyToken(cfg, host, purpose, value, clock = now()) {
+function decodeLiveToken(purpose, value, clock = now()) {
   const bytes = decodeToken(value);
   if (!bytes) return null;
   const expires = view(bytes).getUint32(0);
   const maxAge = purpose === BOOTSTRAP ? BOOT_LIFETIME :
     purpose === SESSION ? TICKET_LIFETIME + BOOT_LIFETIME : GRANT_LIFETIME + BOOT_LIFETIME;
   if (expires <= clock || expires > clock + maxAge) return null;
-  const body = bytes.subarray(0, 16);
-  if (!equalBytes(bytes.subarray(16), await carrierMAC(cfg, host, purpose, body))) return null;
+  return { bytes, expires };
+}
+
+async function authenticateToken(cfg, host, purpose, { bytes, expires }, clock = now()) {
+  if (expires <= clock || !equalBytes(bytes.subarray(16), await carrierMAC(cfg, host, purpose, bytes.subarray(0, 16)))) {
+    return null;
+  }
   return { expires, id: bytes.subarray(4, 16) };
+}
+
+async function verifyToken(cfg, host, purpose, value, clock = now()) {
+  const token = decodeLiveToken(purpose, value, clock);
+  return token && authenticateToken(cfg, host, purpose, token, clock);
 }
 
 async function sessionTickets(cfg, host, expires, id) {
@@ -278,6 +305,8 @@ const groups = new Map();
 const counters = Object.create(null);
 const timingBounds = [10, 25, 50, 100, 200, 400, 800, 1600, 3000, 6000];
 const timings = {
+  bridgeConfig: new Uint32Array(timingBounds.length + 1),
+  bridgePage: new Uint32Array(timingBounds.length + 1),
   client: new Uint32Array(timingBounds.length + 1),
   upgrade: new Uint32Array(timingBounds.length + 1),
   kws: new Uint32Array(timingBounds.length + 1),
@@ -352,16 +381,20 @@ function timingSummary(histogram) {
   return samples + ' 次，P95 ' + bound + ' ms';
 }
 
-export default {
-  async fetch(request, env) {
-    try {
-      return await route(request, env);
-    } catch {
-      count('request');
-      return unavailable();
-    }
-  },
-};
+function createWorker(dial = dialKWS, directTCP = false) {
+  return {
+    async fetch(request, env) {
+      try {
+        return await route(request, env, dial, directTCP);
+      } catch {
+        count('request');
+        return unavailable();
+      }
+    },
+  };
+}
+
+export default createWorker();
 
 
 function sessionID(bootstrap) {
@@ -378,10 +411,8 @@ const logoutPath = adminPath + '/logout';
 const loginAttempts = new Map();
 let loginWindow = -1, loginTotal = 0;
 
-const passwordSetting = env => env.p ?? env.PORTAL_PASSWORD;
-
 function portalPassword(env) {
-  const value = passwordSetting(env);
+  const value = env.p;
   if (typeof value !== 'string' || value.length < 16 || value.length > 256) return null;
   const bytes = textEncoder.encode(value);
   return bytes.length <= 256 ? bytes : null;
@@ -415,9 +446,7 @@ async function portalSessionMAC(cfg, host, password, body) {
   return carrierMAC(cfg, host, PORTAL_SESSION, append(await passwordDigest(password), body));
 }
 
-async function routePortal(request, env, url, host) {
-  const password = portalPassword(env);
-  if (!password) return unavailable();
+async function routePortal(request, env, url, host, password) {
   const { pathname, search } = url;
   const { method, headers } = request;
   const read = method === 'GET' || method === 'HEAD';
@@ -436,7 +465,7 @@ async function routePortal(request, env, url, host) {
         !equalBytes(await passwordDigest(value), await passwordDigest(password))) {
       return loginResponse(method, '密码有误，请重试。', 401);
     }
-    const cfg = await configuration(env, host, true).catch(() => {
+    const cfg = await configuration(env, host, true, password).catch(() => {
       count('configuration-error');
       return null;
     });
@@ -446,19 +475,21 @@ async function routePortal(request, env, url, host) {
     token.set(await portalSessionMAC(cfg, host, password, token.subarray(0, 16)), 16);
     return portalRedirect(adminPath, b64(token), PORTAL_LIFETIME);
   }
-  if (!read || (search && search !== '?diagnostics=1')) return unavailable();
+  const probe = search === '?probe=1' && method === 'HEAD';
+  if (!read || (search && search !== '?diagnostics=1' && !probe)) return unavailable();
   const cookies = (headers.get('Cookie') ?? '').split(';').map(value => value.trim())
     .filter(value => value.startsWith(portalCookie + '='));
   const token = cookies.length === 1 && decodeToken(cookies[0].slice(portalCookie.length + 1));
-  if (!token || view(token).getUint32(0) <= now()) return loginResponse(method);
-  const cfg = await configuration(env, host);
+  if (!token || view(token).getUint32(0) <= now()) return probe ? unavailable() : loginResponse(method);
+  const cfg = await configuration(env, host, false, password);
   if (!cfg || !equalBytes(token.subarray(16), await portalSessionMAC(cfg, host, password, token.subarray(0, 16)))) {
-    return loginResponse(method);
+    return probe ? unavailable() : loginResponse(method);
   }
-  return portalResponse(host, cfg.secret, request, Boolean(search), true);
+  if (probe) return new Response(null, { status: 204, headers: noStore });
+  return portalResponse(host, cfg.secret, request, Boolean(search));
 }
 
-async function route(request, env) {
+async function route(request, env, dial, directTCP) {
   const url = new URL(request.url);
   const host = canonicalHost(url);
   if (!host) return unavailable();
@@ -468,33 +499,34 @@ async function route(request, env) {
     return publicHomeResponse(method);
   }
   if (path === adminPath || path === logoutPath) {
-    return routePortal(request, env, url, host);
+    const password = portalPassword(env);
+    return password ? routePortal(request, env, url, host, password) : unavailable();
   }
   const sameOrigin = !headers.has('Origin') || headers.get('Origin') === url.origin;
   const capability = method === 'GET' && path === '/' && /^\?bridge=([A-Za-z0-9_-]{43})$/.exec(url.search)?.[1];
-  const diagnostics = url.search === '?diagnostics=1';
-  const portal = passwordSetting(env) === undefined && env.PROXY_SEED === undefined &&
-    (method === 'GET' || method === 'HEAD') &&
-    (!url.search || diagnostics) && /^\/[0-9a-f]{64}$/i.test(path);
   const api = !url.search && sameOrigin;
   const session = api && path === '/api/v1/session' && (method === 'POST' || method === 'DELETE');
   const renewal = api && path === '/api/v1/session/renew' && method === 'POST';
   const upgrade = api && path === '/api/v1/ws' && method === 'GET' &&
     headers.get('Upgrade')?.toLowerCase() === 'websocket' && parseLaneProtocol(headers);
-  const token = (session || renewal) && !headers.has('Cookie') ? bearer(request) : null;
-  if (!(portal || capability || upgrade || token)) return unavailable();
-  if (portal) {
-    const accessCode = env.PORTAL_KEY;
-    if (typeof accessCode !== 'string' || !accessCodePattern.test(accessCode) ||
-        !equalBytes(hex(path.slice(1)), hex(accessCode))) return unavailable();
+  if (renewal || (session && method === 'POST')) {
+    const length = headers.get('Content-Length');
+    if (length !== null && length !== String(renewal ? 0 : helloFrame.length)) return unavailable();
+    if (session && headers.get('Content-Type')?.trim().toLowerCase() !== 'application/octet-stream') return unavailable();
   }
+  const token = (session || renewal) && !headers.has('Cookie') ? bearer(request) : null;
+  const purpose = upgrade || method === 'DELETE' ? SESSION : renewal ? RENEWAL : BOOTSTRAP;
+  const claims = decodeLiveToken(purpose, upgrade ? upgrade.token : token);
+  if (!((capability && canonicalTokenPattern.test(capability)) || claims)) return unavailable();
+  const password = portalPassword(env);
+  if (!password) return unavailable();
 
-  const started = upgrade ? Date.now() : 0;
-  const cfg = await configuration(env, host);
+  const started = upgrade || capability ? Date.now() : 0;
+  const cfg = await configuration(env, host, false, password);
   if (!cfg) return unavailable();
 
-  if (portal) return portalResponse(host, cfg.secret, request, diagnostics);
   if (capability) {
+    const configured = Date.now();
     if (!(await verifyBridge(cfg.bridgeKey, host, capability))) return unavailable();
     // The verified Bridge request already authenticates the client. It can
     // carry the first ticket while the bridge validates HELLO locally.
@@ -506,12 +538,14 @@ async function route(request, env) {
       issueToken(cfg, host, BOOTSTRAP, expires, id),
       sessionTickets(cfg, host, fastExpiry, id),
     ]);
-    return bridgeResponse(host, boot, { ticket, grant, ttl: fastExpiry - now() });
+    const response = bridgeResponse(host, boot, { ticket, grant, ttl: fastExpiry - now() });
+    observeTiming(timings.bridgeConfig, configured - started);
+    observeTiming(timings.bridgePage, Date.now() - started);
+    return response;
   }
-  if (upgrade) return upgradeLane(request, cfg, host, upgrade, started);
-  const purpose = renewal ? RENEWAL : method === 'DELETE' ? SESSION : BOOTSTRAP;
-  const auth = await verifyToken(cfg, host, purpose, token);
-  if (!auth) return unavailable();
+  const auth = await authenticateToken(cfg, host, purpose, claims);
+  if (!auth || now() >= auth.expires) return unavailable();
+  if (upgrade) return upgradeLane(request, cfg, host, upgrade, auth, started, dial, directTCP);
   const deadline = view(auth.id).getUint32(0);
   const key = groupKey(host, auth.id);
   if (method === 'DELETE') {
@@ -525,34 +559,37 @@ async function route(request, env) {
     if (!(await readExactBody(request, EMPTY)) || now() >= auth.expires || groups.get(key)?.deleted) return unavailable();
     const expires = Math.min(now() + TICKET_LIFETIME, auth.expires);
     const ticket = await issueToken(cfg, host, SESSION, expires, auth.id);
+    const ttl = expires - now();
+    if (ttl <= 0 || groups.get(key)?.deleted) return unavailable();
     return new Response(null, { status: 204, headers: {
-      ...noStore, 'X-Session-Token': ticket, 'X-Session-TTL': String(expires - now()),
+      ...noStore, 'X-Session-Token': ticket, 'X-Session-TTL': String(ttl),
     } });
   }
-  if (headers.get('Content-Type')?.trim().toLowerCase() !== 'application/octet-stream' ||
-      !(await readExactBody(request, helloFrame)) || now() >= auth.expires || groups.get(key)?.deleted) return unavailable();
+  if (!(await readExactBody(request, helloFrame)) || now() >= auth.expires || groups.get(key)?.deleted) return unavailable();
   // Byte-identical creation retries get the same tickets in every isolate.
   const expires = auth.expires - BOOT_LIFETIME + TICKET_LIFETIME;
   const [ticket, refresh] = await sessionTickets(cfg, host, expires, auth.id);
+  const issued = now();
+  if (issued >= auth.expires || groups.get(key)?.deleted) return unavailable();
   return new Response(encodeFrame(WELCOME, 0), {
     headers: {
       ...noStore, 'Content-Type': 'application/octet-stream',
       'X-Carrier-Mode': 'websocket-lanes', 'X-Down-Cursor': '0',
-      'X-Session-Token': ticket, 'X-Session-TTL': String(expires - now()), 'X-Session-Renewal': refresh,
+      'X-Session-Token': ticket, 'X-Session-TTL': String(expires - issued), 'X-Session-Renewal': refresh,
     },
   });
 }
 
 function parseLaneProtocol(headers) {
+  const version = headers.get('Sec-WebSocket-Version');
+  if (version !== null && version !== '13') return null;
   const protocol = headers.get('Sec-WebSocket-Protocol');
   const match = /^tproxy-lane-v1\.([A-Za-z0-9_-]{43})\.([1-9][0-9]{0,7})$/.exec(protocol ?? '');
   if (!match || Number(match[2]) > MAX_SID) return null;
   return { protocol, token: match[1], sid: Number(match[2]) };
 }
 
-async function upgradeLane(request, cfg, host, { protocol, token, sid }, started) {
-  const auth = await verifyToken(cfg, host, SESSION, token);
-  if (!auth) return unavailable();
+function upgradeLane(request, cfg, host, { protocol, sid }, auth, started, dial, directTCP) {
   const group = getGroup(groupKey(host, auth.id), view(auth.id).getUint32(0));
   if (group?.deleted || group?.used.has(sid)) return unavailable();
   if (!group || group.used.size >= 4096 || group.active >= 64 ||
@@ -566,7 +603,7 @@ async function upgradeLane(request, cfg, host, { protocol, token, sid }, started
   const release = () => { group.active--; activeLanes--; };
   let lane;
   try {
-    lane = new Lane(server, sid, cfg.proxyKey, group, connectKWS, { release });
+    lane = new Lane(server, sid, cfg.proxyKey, group, dial, { release, directTCP });
     lane.attach();
     const response = new Response(null, { status: 101, webSocket: client, headers: {
       ...noStore, 'Sec-WebSocket-Protocol': protocol, 'Sec-WebSocket-Extensions': '',
@@ -576,7 +613,12 @@ async function upgradeLane(request, cfg, host, { protocol, token, sid }, started
     return response;
   } catch {
     if (lane) lane.stop('attach', false);
-    else release();
+    else {
+      release();
+      releaseSocket(server);
+    }
+    group.used.delete(sid);
+    recordedIds--;
     return unavailable();
   }
 }
@@ -593,6 +635,8 @@ function advanceCounter(counter, blocks) {
 
 function createCTR(rawKey, counter) {
   const key = subtle.importKey('raw', rawKey, 'AES-CTR', false, ['encrypt']);
+  // A lane can close before using every key. The first use still sees a failed import.
+  void key.catch(() => {});
   const iv = new Uint8Array(counter);
   const start = new Uint8Array(16);
   const tail = new Uint8Array(16);
@@ -655,7 +699,7 @@ function readHead(head) {
   return { mode, dc: Math.abs(dc), media: dc < 0 };
 }
 
-function makeHead({ mode, dc, media }) {
+function makeHead({ mode, dc, media }, directTCP = false) {
   const head = new Uint8Array(64);
   const header = view(head);
   const forbidden = [0x48454144, 0x504f5354, 0x47455420, 0x4f505449, 0xeeeeeeee, 0xdddddddd, 0x16030102];
@@ -663,7 +707,7 @@ function makeHead({ mode, dc, media }) {
     crypto.getRandomValues(head);
   } while (head[0] === 0xef || forbidden.includes(header.getUint32(0)) || !header.getUint32(4));
   head.fill(mode, 56, 60);
-  header.setInt16(60, media ? -dc : dc, true);
+  if (!directTCP) header.setInt16(60, media ? -dc : dc, true);
   return head;
 }
 
@@ -739,7 +783,15 @@ class Queue {
   bytes = 0;
 
   get length() { return this.items.length - this.head; }
-  peek() { return this.items[this.head]; }
+  prefixBytes(limit) {
+    let bytes = 0;
+    for (let index = this.head; index < this.items.length; index++) {
+      const size = this.items[index].data.length;
+      if (bytes + size > limit) break;
+      bytes += size;
+    }
+    return bytes;
+  }
 
   add(item) {
     this.items.push(item);
@@ -786,13 +838,67 @@ function releaseUpgrade(response) {
 const MAX_PARALLEL_BACKUPS = 8;
 let parallelBackups = 0;
 
-async function attemptKWS(host, attempt, fetcher, timeout) {
+// Each route keeps state for its two official endpoints only. A new isolate
+// starts with the protocol's original control/media preference.
+class UpstreamRouter {
+  paths = Array.from({ length: 10 }, () => Array.from({ length: 2 }, () => ({
+    failures: 0, lastFailure: 0, retryAt: 0, serial: 0, latestSuccess: 0,
+  })));
+
+  constructor(clock = Date.now) {
+    this.clock = clock;
+  }
+
+  path({ dc, media }, candidate) {
+    return this.paths[(dc - 1) * 2 + Number(media)][candidate];
+  }
+
+  plan(info) {
+    const primary = this.path(info, 0).retryAt;
+    const alternate = this.path(info, 1).retryAt;
+    return primary > this.clock() && primary > alternate ? [1, 0] : [0, 1];
+  }
+
+  canHedge(info, candidate) {
+    return this.path(info, candidate).retryAt <= this.clock();
+  }
+
+  start(info, candidate) {
+    const path = this.path(info, candidate);
+    const generation = ++path.serial;
+    const time = this.clock();
+    if (path.retryAt && path.retryAt <= time) path.retryAt = time + 5000;
+    return success => {
+      const completed = this.clock();
+      if (success) {
+        path.latestSuccess = Math.max(path.latestSuccess, generation);
+        path.failures = path.retryAt = 0;
+      } else if (generation > path.latestSuccess) {
+        path.failures = completed - path.lastFailure <= 30000 ? path.failures + 1 : 1;
+        path.lastFailure = completed;
+        if (path.failures >= 2) path.retryAt = completed + 15000;
+      }
+    };
+  }
+}
+
+const kwsRouter = new UpstreamRouter();
+
+function dialKWS(info, signal) {
+  return connectKWS(info, signal, fetch, 3000, 900, kwsRouter);
+}
+
+async function attemptKWS(host, attempt, fetcher, timeout, record) {
   const signal = attempt.signal;
   if (signal.aborted) return null;
   let wake;
   const stopped = new Promise(resolve => { wake = () => resolve(null); });
   signal.addEventListener('abort', wake, { once: true });
-  const timer = setTimeout(() => attempt.abort(), timeout);
+  const timer = setTimeout(() => {
+    count('kws-handshake-timeout');
+    record?.(false);
+    attempt.abort();
+  }, timeout);
   try {
     const response = await Promise.race([stopped, fetcher('https://' + host + '/apiws', {
       headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': 'binary' },
@@ -806,11 +912,20 @@ async function attemptKWS(host, attempt, fetcher, timeout) {
     if (!response) return null;
     if (signal.aborted || response.status !== 101 || !response.webSocket ||
         response.headers.get('Sec-WebSocket-Protocol') !== 'binary') {
+      if (!signal.aborted) {
+        count(response.status === 101 ? 'kws-handshake-protocol' : 'kws-handshake-http');
+        record?.(false);
+      }
       releaseUpgrade(response);
       return null;
     }
+    record?.(true);
     return response.webSocket;
   } catch {
+    if (!signal.aborted) {
+      count('kws-handshake-network');
+      record?.(false);
+    }
     return null;
   } finally {
     clearTimeout(timer);
@@ -818,20 +933,23 @@ async function attemptKWS(host, attempt, fetcher, timeout) {
   }
 }
 
-async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupDelay = 900) {
+async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupDelay = 900, router) {
   if (!Number.isInteger(info.dc) || info.dc < 1 || info.dc > 5 || typeof info.media !== 'boolean') {
     throw new LaneFault('obfuscation');
   }
   if (signal.aborted) throw new LaneFault('kws-connect');
 
   const hosts = kwsHosts(info);
-  const attempts = [new AbortController(), new AbortController()];
+  const order = router?.plan(info) ?? [0, 1];
+  if (order[0] === 1) count('kws-cooldown-bypass');
+  const attempts = [];
   const started = Date.now();
 
   return new Promise((resolve, reject) => {
     let done = false, pending = 0, backupStarted = false, parallel = false;
     const timer = setTimeout(() => {
       if (done || backupStarted || parallelBackups >= MAX_PARALLEL_BACKUPS) return;
+      if (router && !router.canHedge(info, order[1])) return;
       parallel = true;
       parallelBackups++;
       count('kws-parallel-backup');
@@ -868,7 +986,11 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
 
     function start(index) {
       pending++;
-      void attemptKWS(hosts[index], attempts[index], fetcher, timeout).then(socket => {
+      const attempt = new AbortController();
+      attempts[index] = attempt;
+      const candidate = order[index];
+      const record = router?.start(info, candidate);
+      void attemptKWS(hosts[candidate], attempt, fetcher, timeout, record).then(socket => {
         pending--;
         if (done) {
           if (socket) releaseSocket(socket);
@@ -921,6 +1043,7 @@ class Lane {
   downBusy = false;
   creditWake = null;
   openTimer = null;
+  expiryTimer = null;
   packetTimer = null;
   nativeTimer = null;
   nativeBytes = [0, 0];
@@ -931,10 +1054,12 @@ class Lane {
     this.secret = secret;
     this.group = group;
     this.dial = dial;
+    this.directTCP = options.directTCP === true;
     this.budget = laneBudget(group);
     this.release = options.release ?? (() => { group.active--; });
     this.openMs = options.openMs ?? 12000;
     this.stallMs = options.stallMs ?? 30000;
+    this.expiresAt = group.expires === undefined ? Infinity : group.expires * 1000;
     this.openedAt = Date.now();
     this.firstUpstream = false;
     this.firstForwarded = false;
@@ -954,6 +1079,9 @@ class Lane {
     socket.addEventListener('error', this.onError);
     socket.accept();
     this.openTimer = setTimeout(() => this.stop('stream-timeout'), this.openMs);
+    if (this.expiresAt !== Infinity) {
+      this.expiryTimer = setTimeout(() => this.stop('session-expired'), Math.max(0, this.expiresAt - Date.now()));
+    }
   }
 
   get ended() { return this.phase === 'closed'; }
@@ -961,6 +1089,7 @@ class Lane {
   assertLive() {
     if (this.ended) throw new LaneFault('normal');
     if (this.group.deleted) throw new LaneFault('revoked');
+    if (this.expiresAt !== Infinity && Date.now() >= this.expiresAt) throw new LaneFault('session-expired');
   }
 
   assertSocket(socket) {
@@ -1036,7 +1165,7 @@ class Lane {
     const clientRead = await obfuscationCipher(header, this.secret);
     const info = readHead(await clientRead(header));
     this.assertLive();
-    const head = makeHead(info);
+    const head = makeHead(info, this.directTCP);
     const dialing = Promise.resolve(this.dial(info, this.controller.signal));
     let peer, prepared;
     const prepare = Promise.all([
@@ -1064,15 +1193,65 @@ class Lane {
     this.peerWrite = peerWrite;
     this.packets = new PacketAssembly(info.mode, this.budget);
     this.head = null;
-    peer.binaryType = 'arraybuffer';
-    peer.addEventListener('message', this.onDown);
-    peer.addEventListener('close', this.onPeerClose);
-    peer.addEventListener('error', this.onPeerError);
-    peer.accept();
-    this.assertSocket(peer);
-    this.writeNative(peer, wire);
+    if (this.directTCP) {
+      await this.writeTCP(peer, wire);
+    } else {
+      peer.binaryType = 'arraybuffer';
+      peer.addEventListener('message', this.onDown);
+      peer.addEventListener('close', this.onPeerClose);
+      peer.addEventListener('error', this.onPeerError);
+      peer.accept();
+      this.assertSocket(peer);
+      this.writeNative(peer, wire);
+    }
     this.phase = 'streaming';
     clearTimeout(this.openTimer);
+    if (this.directTCP) void this.readTCP(peer);
+  }
+
+  async writeTCP(peer, bytes) {
+    this.assertLive();
+    const timer = setTimeout(() => this.stop('tcp-write-timeout'), this.stallMs);
+    try {
+      await peer.write(bytes);
+      this.assertLive();
+    } catch {
+      throw new LaneFault('tcp-write');
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async readTCP(peer) {
+    let readSize = DOWN_FRAME;
+    try {
+      while (!this.ended) {
+        if (!this.sending) await this.waitForCredit();
+        if (congested(this.socket, Math.min(DOWN_FRAME, this.sending) + 8)) {
+          await this.drain(this.socket, Math.min(DOWN_FRAME, this.sending) + 8);
+        }
+        // A BYOB read can neither exceed credit nor allocate an unbounded chunk.
+        const size = Math.min(this.sending, readSize);
+        this.budget.hold(size);
+        try {
+          const { done, value } = await peer.read(size);
+          this.assertLive();
+          if (done) {
+            this.stop('tcp-close');
+            return;
+          }
+          // Increase capacity only when the reader uses the entire buffer.
+          if (size === readSize) {
+            readSize = value.byteLength === size ? Math.min(CRYPT_CHUNK, size * 2) : Math.max(DOWN_FRAME, size / 2);
+          }
+          await this.enqueueDown(value);
+        } finally {
+          this.budget.release(size);
+        }
+      }
+    } catch (error) {
+      this.fault(error instanceof LaneFault ? error : new LaneFault('tcp-read'));
+    }
   }
 
   async feed(raw) {
@@ -1135,7 +1314,9 @@ class Lane {
     this.assertLive();
     const peer = this.peer;
     let wire;
-    const large = bytes.length > BULK_PACK;
+    // A single native call needs at most the previous output + chunk reserve
+    // up to 512 KiB. Bigger packets keep bounded padding scratch space.
+    const large = bytes.length > CRYPT_CHUNK;
     const reserve = large ? bytes.length + 512 * KiB + 64 : 2 * (bytes.length + 32);
     this.budget.hold(reserve);
     try {
@@ -1147,6 +1328,10 @@ class Lane {
         }
       } else {
         wire = await this.peerWrite(bytes);
+      }
+      if (this.directTCP) {
+        await this.writeTCP(peer, wire);
+        return;
       }
       let start = 0;
       for (const end of ends) {
@@ -1165,35 +1350,43 @@ class Lane {
     this.upBusy = true;
     try {
       while (!this.ended && this.up.length) {
-        const batch = [this.up.take()];
-        let length = batch[0].data.length, copy = 0;
-        const limit = packLimit(length);
+        let item = this.up.take();
+        let raw = item.data, copy = 0;
+        const length = raw.length + this.up.prefixBytes(packLimit(raw.length) - raw.length);
         try {
-          while (this.up.length && length + this.up.peek().data.length <= limit) {
-            const item = this.up.take();
-            length += item.data.length;
-            batch.push(item);
-          }
-          let raw = batch[0].data;
-          if (batch.length > 1) {
+          if (length !== raw.length) {
             this.budget.hold(length);
             copy = length;
-            raw = new Uint8Array(length);
-            let offset = 0;
-            for (const item of batch) {
-              raw.set(item.data, offset);
-              offset += item.data.length;
+            const packed = new Uint8Array(length);
+            packed.set(raw);
+            let offset = raw.length;
+            this.releaseUp(item);
+            item = null;
+            while (offset < length) {
+              const next = this.up.take();
+              packed.set(next.data, offset);
+              offset += next.data.length;
+              this.releaseUp(next);
             }
+            raw = packed;
           }
           await this.feed(raw);
+          // The CREDIT notification can block even after the upstream send.
+          raw = null;
+          if (item) {
+            this.releaseUp(item);
+            item = null;
+          }
+          if (copy) {
+            this.budget.release(copy);
+            copy = 0;
+          }
           this.assertLive();
           if (congested(this.socket, 12)) await this.drain(this.socket, 12);
-          const delta = new Uint8Array(4);
-          view(delta).setUint32(0, length);
-          this.send(CREDIT, delta);
+          this.sendCredit(length);
           this.receiving += length;
         } finally {
-          for (const item of batch) this.releaseUp(item);
+          if (item) this.releaseUp(item);
           if (copy) this.budget.release(copy);
         }
       }
@@ -1218,7 +1411,7 @@ class Lane {
         this.firstUpstream = true;
       }
       this.down.add({ data });
-      if (!this.downBusy) void this.pumpDown();
+      if (!this.downBusy) return this.pumpDown();
     } catch (error) {
       this.fault(error);
     }
@@ -1251,33 +1444,45 @@ class Lane {
     this.downBusy = true;
     try {
       while (!this.ended && this.down.length) {
-        const batch = [this.down.take()];
-        let length = batch[0].data.length, copy = 0;
-        const limit = packLimit(length);
+        let item = this.down.take();
+        let bytes = item.data, copy = 0;
+        const length = bytes.length + this.down.prefixBytes(packLimit(bytes.length) - bytes.length);
         try {
-          while (this.down.length && length + this.down.peek().data.length <= limit) {
-            const item = this.down.take();
-            length += item.data.length;
-            batch.push(item);
-          }
-          let bytes = batch[0].data;
-          if (batch.length > 1) {
+          if (length !== bytes.length) {
             this.budget.hold(length);
             copy = length;
-            bytes = new Uint8Array(length);
-            let offset = 0;
-            for (const item of batch) {
-              bytes.set(item.data, offset);
-              offset += item.data.length;
+            const packed = new Uint8Array(length);
+            packed.set(bytes);
+            let offset = bytes.length;
+            this.releaseDown(item);
+            item = null;
+            while (offset < length) {
+              const next = this.down.take();
+              packed.set(next.data, offset);
+              offset += next.data.length;
+              this.releaseDown(next);
             }
+            bytes = packed;
           }
           for (let offset = 0; offset < length;) {
             if (!this.sending) await this.waitForCredit();
-            const size = Math.min(this.sending, DOWN_CRYPT, length - offset);
+            const size = Math.min(this.sending, CRYPT_CHUNK, length - offset);
             const reserve = 4 * (size + 32);
             this.budget.hold(reserve);
             try {
               const plain = await this.peerRead(bytes.subarray(offset, offset + size));
+              if (offset + size === length) {
+                // Sending may wait on the client. The upstream ciphertext is
+                // no longer referenced by WebCrypto or by the send queue.
+                bytes = null;
+                if (copy) {
+                  this.budget.release(copy);
+                  copy = 0;
+                } else {
+                  this.releaseDown(item);
+                  item = null;
+                }
+              }
               this.assertLive();
               const wire = await this.clientWrite(plain);
               for (let pos = 0; pos < wire.length;) {
@@ -1312,7 +1517,7 @@ class Lane {
             offset += size;
           }
         } finally {
-          for (const item of batch) this.releaseDown(item);
+          if (item) this.releaseDown(item);
           if (copy) this.budget.release(copy);
         }
       }
@@ -1323,9 +1528,14 @@ class Lane {
     }
   }
 
-  send(type, payload) {
+  sendCredit(length) {
     this.assertSocket(this.socket);
-    this.writeNative(this.socket, encodeFrame(type, this.sid, payload));
+    const bytes = new Uint8Array(12);
+    const header = view(bytes);
+    header.setUint32(0, CREDIT * 0x1000000 + this.sid);
+    header.setUint32(4, 4);
+    header.setUint32(8, length);
+    this.writeNative(this.socket, bytes);
   }
 
   reconcileNative(socket, side) {
@@ -1338,15 +1548,18 @@ class Lane {
     }
   }
 
-  scheduleNativeCheck() {
-    if (this.nativeTimer !== null || !this.nativeBytes.some(Boolean)) return;
+  scheduleNativeCheck(delay = 30) {
+    if (this.nativeTimer !== null || !(this.nativeBytes[0] || this.nativeBytes[1])) return;
     this.nativeTimer = setTimeout(() => {
       this.nativeTimer = null;
       if (this.ended) return;
+      const before = this.nativeBytes[0] + this.nativeBytes[1];
       this.reconcileNative(this.socket, 0);
       this.reconcileNative(this.peer, 1);
-      this.scheduleNativeCheck();
-    }, 30);
+      // Bound the polling cost while the native queue makes no progress.
+      const drained = this.nativeBytes[0] + this.nativeBytes[1] < before;
+      this.scheduleNativeCheck(drained ? 30 : Math.min(delay * 2, 250));
+    }, delay);
   }
 
   writeNative(socket, payload) {
@@ -1368,8 +1581,10 @@ class Lane {
     this.phase = 'closed';
     count(kind);
     clearTimeout(this.openTimer);
+    clearTimeout(this.expiryTimer);
     clearTimeout(this.packetTimer);
     clearTimeout(this.nativeTimer);
+    this.openTimer = this.expiryTimer = this.packetTimer = this.nativeTimer = null;
     this.budget.release(this.nativeBytes[0] + this.nativeBytes[1]);
     this.nativeBytes.fill(0);
     this.controller.abort();
@@ -1384,14 +1599,19 @@ class Lane {
     socket.removeEventListener('message', this.onMessage);
     socket.removeEventListener('close', this.onClose);
     socket.removeEventListener('error', this.onError);
-    peer?.removeEventListener('message', this.onDown);
-    peer?.removeEventListener('close', this.onPeerClose);
-    peer?.removeEventListener('error', this.onPeerError);
+    if (peer && !this.directTCP) {
+      peer.removeEventListener('message', this.onDown);
+      peer.removeEventListener('close', this.onPeerClose);
+      peer.removeEventListener('error', this.onPeerError);
+    }
     this.release();
-    if (notify && socket.readyState === 1 && !congested(socket, 8)) {
+    const parentInvalid = kind === 'session-expired' || kind === 'revoked';
+    // These close codes carry parent or policy status. A preceding lane CLOSE
+    // would make the Bridge detach before it receives the WebSocket close.
+    if (notify && !parentInvalid && kind !== 'frame' && socket.readyState === 1 && !congested(socket, 8)) {
       try { socket.send(encodeFrame(CLOSE, this.sid)); } catch {}
     }
-    safeClose(socket, kind === 'frame' ? 1008 : kind === 'queue' ? 1013 : 1000);
+    safeClose(socket, parentInvalid ? SESSION_EXPIRED_CLOSE : kind === 'frame' ? 1008 : kind === 'queue' ? 1013 : 1000);
     safeClose(peer);
   }
 }
@@ -1403,9 +1623,11 @@ function runBridge(origin, fast, bootstrap) {
   const tokenPattern = /^[A-Za-z0-9_-]{43}$/;
   const lanes = new Map(), used = new Set();
   const lifetime = new AbortController();
+  const rejected = Symbol();
   const fragment = /^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash)?.[1];
   try { history.replaceState(null, '', location.pathname); } catch {}
-  let port, started = false, ready = false, closed = false, status;
+  let port, started = false, ready = false, closed = false, failing = false, status;
+  let startupDeadline = 0, startupTimer;
   let ticket = '', grant = '', until = 0, renewal;
   let pendingBytes = 0, pendingItems = 0;
   let trafficTimer = null, sentBytes = 0, receivedBytes = 0;
@@ -1439,7 +1661,7 @@ function runBridge(origin, fast, bootstrap) {
       const length = data.getUint32(offset + 4);
       const end = offset + 8 + length;
       if (length > 1048576 || end > buffer.byteLength) throw Error();
-      fn(id >>> 24, id & 0xffffff, length, offset, end);
+      fn(id >>> 24, id & 0xffffff, length, offset, end, data);
       offset = end;
     }
   }
@@ -1453,47 +1675,72 @@ function runBridge(origin, fast, bootstrap) {
     pendingBytes -= lane.bytes;
     pendingItems -= lane.queue.length - lane.head;
     lane.queue.length = lane.bytes = lane.head = 0;
-    try { lane.socket?.close(); } catch {}
+    const ws = lane.socket;
+    lane.socket = null;
+    if (ws) {
+      ws.onopen = ws.onmessage = ws.onclose = null;
+      if (ws.readyState < 2) {
+        try { ws.close(); } catch {}
+      }
+    }
     if (notify && !closed) {
       const frame = new ArrayBuffer(8);
       new DataView(frame).setUint32(0, 3 * 0x1000000 + lane.id);
-      port.postMessage(frame, [frame]);
+      try { port.postMessage(frame, [frame]); } catch { fail(); }
     }
+  }
+
+  function laneFailed(lane) {
+    if (closed || lane.done) return;
+    const lastStartupLane = startupDeadline && lanes.size === 1;
+    finish(lane, !lastStartupLane);
+    if (lastStartupLane) fail();
   }
 
   function shutdown() {
     if (closed) return;
     closed = true;
     lifetime.abort();
+    clearTimeout(startupTimer);
     clearTimeout(trafficTimer);
     for (const lane of lanes.values()) finish(lane, false);
-    port?.close();
+    used.clear();
+    try { port?.close(); } catch {}
     if (ticket && performance.now() < until) {
-      fetch(origin + '/api/v1/session', {
-        method: 'DELETE', keepalive: true, mode: 'same-origin', credentials: 'omit',
-        redirect: 'error', cache: 'no-store', referrerPolicy: 'no-referrer',
-        headers: { Authorization: 'Bearer ' + ticket },
-      }).catch(() => {});
+      try {
+        fetch(origin + '/api/v1/session', {
+          method: 'DELETE', keepalive: true, mode: 'same-origin', credentials: 'omit',
+          redirect: 'error', cache: 'no-store', referrerPolicy: 'no-referrer',
+          headers: { Authorization: 'Bearer ' + ticket },
+        }).catch(() => {});
+      } catch {}
     }
     ticket = grant = '';
   }
 
   function fail() {
-    if (closed) return;
-    try {
-      report('failed');
-      port.postMessage({ t: 'close' });
-    } finally {
-      shutdown();
-    }
+    if (closed || failing) return;
+    failing = true;
+    try { report('failed'); } catch {}
+    try { port?.postMessage({ t: 'close' }); } catch {}
+    shutdown();
+  }
+
+  function parentFailed() {
+    until = 0;
+    fail();
   }
 
   async function request(path, auth, body, code) {
+    const deadline = Math.min(startupDeadline || Infinity, performance.now() + 21500);
     for (let attempt = 0; attempt < 4 && !closed; attempt++) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return null;
       const control = new AbortController();
       const cancel = () => control.abort();
       lifetime.signal.addEventListener('abort', cancel, { once: true });
-      const timer = setTimeout(cancel, 4500);
+      const timer = setTimeout(cancel, Math.min(4500, remaining));
+      let retryAfter = 0;
       try {
         const response = await fetch(origin + path, {
           method: 'POST', body, mode: 'same-origin', credentials: 'omit',
@@ -1501,12 +1748,16 @@ function runBridge(origin, fast, bootstrap) {
           headers: { Authorization: 'Bearer ' + auth, ...(body && { 'Content-Type': 'application/octet-stream' }) },
           signal: control.signal,
         });
-        if (response.status === code) {
+        if (response.status === code && !control.signal.aborted) {
           const welcome = body ? await response.arrayBuffer() : null;
-          return { response, welcome };
+          if (!control.signal.aborted && performance.now() <= deadline) return { response, welcome };
         }
-        if (response.status !== 503) return null;
         response.body?.cancel().catch(() => {});
+        if (!control.signal.aborted && response.status !== 503) {
+          return response.status >= 500 || response.status === 408 || response.status === 429 ? null : rejected;
+        }
+        const seconds = response.headers.get('Retry-After');
+        if (response.status === 503 && /^\d+$/.test(seconds ?? '')) retryAfter = Number(seconds) * 1000;
       } catch {
         if (closed) return null;
       } finally {
@@ -1514,7 +1765,8 @@ function runBridge(origin, fast, bootstrap) {
         lifetime.signal.removeEventListener('abort', cancel);
       }
       if (attempt < 3) {
-        const delay = 250 * 2 ** attempt + Math.random() * 120;
+        const delay = Math.max(retryAfter, 250 * 2 ** attempt) + Math.random() * 120;
+        if (closed || delay >= deadline - performance.now()) return null;
         await new Promise(resolve => {
           const timer = setTimeout(done, delay);
           lifetime.signal.addEventListener('abort', done, { once: true });
@@ -1537,12 +1789,14 @@ function runBridge(origin, fast, bootstrap) {
   }
 
   async function currentTicket() {
-    if (until - performance.now() > 10000) return ticket;
     // All lanes opened together share a renewal, while established lanes continue.
     renewal ??= (async () => {
       const result = await request('/api/v1/session/renew', grant, undefined, 204);
-      if (!result || closed) throw Error();
-      updateTicket(result.response.headers.get('X-Session-Token'), Number(result.response.headers.get('X-Session-TTL')));
+      if (closed || !result) return null;
+      if (result === rejected) { parentFailed(); return null; }
+      try {
+        updateTicket(result.response.headers.get('X-Session-Token'), Number(result.response.headers.get('X-Session-TTL')));
+      } catch { parentFailed(); return null; }
       return ticket;
     })().finally(() => { renewal = null; });
     return renewal;
@@ -1601,44 +1855,58 @@ function runBridge(origin, fast, bootstrap) {
     if (lane.opening || lane.done || closed) return;
     lane.opening = true;
     try {
-      const auth = await currentTicket();
+      const auth = until - performance.now() > 10000 ? ticket : await currentTicket();
       if (closed || lane.done) return;
+      if (!auth) { laneFailed(lane); return; }
+      const remaining = startupDeadline ? startupDeadline - performance.now() : 8000;
+      if (remaining <= 0) { fail(); return; }
+      const handshakeMs = Math.min(8000, remaining);
+      const handshakeDeadline = performance.now() + handshakeMs;
       const protocol = 'tproxy-lane-v1.' + auth + '.' + lane.id;
       const ws = lane.socket = new WebSocket(WS, protocol);
       ws.binaryType = 'arraybuffer';
       lane.handshake = setTimeout(() => {
-        if (!lane.done && lane.socket === ws && !lane.opened) fail();
-      }, 8000);
+        if (!lane.done && lane.socket === ws && !lane.opened) laneFailed(lane);
+      }, handshakeMs);
       ws.onopen = () => {
-        if (closed || lane.done || lane.socket !== ws) { ws.close(); return; }
+        if (closed || lane.done || lane.socket !== ws) return;
         if (ws.protocol !== protocol) { fail(); return; }
+        if (performance.now() >= handshakeDeadline) { laneFailed(lane); return; }
         clearTimeout(lane.handshake);
         lane.opened = true;
+        if (startupDeadline) {
+          clearTimeout(startupTimer);
+          startupDeadline = 0;
+        }
         try { flush(lane); } catch { finish(lane, true); }
       };
       ws.onmessage = event => {
         if (closed || lane.done || lane.socket !== ws) return;
         try {
           let ended = false;
-          eachFrame(event.data, (type, id, length, start) => {
+          let boundaries;
+          eachFrame(event.data, (type, id, length, start, end, view) => {
             if (id !== lane.id || ended) throw Error();
+            if (port.postFrames && (start || end < event.data.byteLength)) (boundaries ??= []).push(end);
             if (type === 3 && !length) ended = true;
             else if (type === 2 && length) return;
-            else if (type === 4 && length === 4 && new DataView(event.data).getUint32(start + 8)) return;
+            else if (type === 4 && length === 4 && view.getUint32(start + 8)) return;
             else throw Error();
           });
           noteTraffic(0, event.data.byteLength);
-          port.postMessage(event.data, [event.data]);
+          if (boundaries) port.postFrames(event.data, boundaries);
+          else port.postMessage(event.data, [event.data]);
           if (ended) finish(lane, false);
         } catch { fail(); }
       };
-      ws.onclose = () => {
+      ws.onclose = event => {
         if (closed || lane.done || lane.socket !== ws) return;
-        if (!lane.opened) fail();
-        else finish(lane, true);
+        if (event?.code === 4001) parentFailed();
+        else if (event?.code === 1008) fail();
+        else laneFailed(lane);
       };
     } catch {
-      if (!lane.done) fail();
+      laneFailed(lane);
     }
   }
 
@@ -1646,7 +1914,7 @@ function runBridge(origin, fast, bootstrap) {
     let buffered = 0;
     const touched = new Set();
     for (const lane of lanes.values()) buffered += lane.socket?.bufferedAmount ?? 0;
-    eachFrame(buffer, (type, id, length, start, end) => {
+    eachFrame(buffer, (type, id, length, start, end, view) => {
       if (closed) return;
       if (!id) throw Error();
       let lane = lanes.get(id);
@@ -1659,7 +1927,7 @@ function runBridge(origin, fast, bootstrap) {
         if (lane) finish(lane, false);
         return;
       } else if (!(type === 2 && length) &&
-                 !(type === 4 && length === 4 && new DataView(buffer).getUint32(start + 8))) throw Error();
+                 !(type === 4 && length === 4 && view.getUint32(start + 8))) throw Error();
       if (!lane) return; // Late DATA or WINDOW for a lane that has closed.
       const size = end - start;
       if (pendingBytes + buffered + size > 33554432 || pendingItems >= 16384 ||
@@ -1694,7 +1962,7 @@ function runBridge(origin, fast, bootstrap) {
         welcome = new Uint8Array([17, 0, 0, 0, 0, 0, 0, 0]).buffer;
       } else {
         const result = await request('/api/v1/session', bootstrap, first, 200);
-        if (!result || closed) { fail(); return; }
+        if (!result || result === rejected || closed) { fail(); return; }
         welcome = result.welcome;
         const { headers } = result.response;
         if (headers.get('X-Carrier-Mode') !== 'websocket-lanes' ||
@@ -1717,7 +1985,7 @@ function runBridge(origin, fast, bootstrap) {
     if (port || closed) return;
     port = next;
     port.onmessage = event => {
-      if (closed) return;
+      if (closed || failing) return;
       const data = event.data;
       try {
         if (data instanceof ArrayBuffer) {
@@ -1726,14 +1994,18 @@ function runBridge(origin, fast, bootstrap) {
             if (hello.byteLength !== 9 || hello.getUint32(0) !== 0x10000000 ||
                 hello.getUint32(4) !== 1 || hello.getUint8(8) !== 1) throw Error();
             started = true;
+            startupDeadline = performance.now() + 30000;
+            startupTimer = setTimeout(fail, 30000);
             void create(data);
           } else if (ready) enqueue(data);
           else throw Error();
         } else if (data?.t === 'close') shutdown();
       } catch { fail(); }
     };
-    port.start();
-    report('connecting');
+    try {
+      port.start();
+      report('connecting');
+    } catch { fail(); }
   }
 
   addEventListener('message', event => {
@@ -1747,6 +2019,7 @@ function runBridge(origin, fast, bootstrap) {
         !supplied.port || supplied.origin !== event.origin) return;
     start(ports[0]);
   });
+  addEventListener('pagehide', shutdown, { once: true });
   const injected = globalThis.TelegramWebProxy;
   if (fragment && typeof injected?.postMessage === 'function') {
     const adapter = {
@@ -1754,12 +2027,13 @@ function runBridge(origin, fast, bootstrap) {
       start() {},
       close() { injected.onmessage = null; },
       postMessage(value) {
-        if (value instanceof ArrayBuffer) {
-          eachFrame(value, (type, id, length, start, end) => {
-            injected.postMessage(start === 0 && end === value.byteLength ? value : value.slice(start, end));
-          });
-        } else {
-          injected.postMessage(JSON.stringify(value));
+        injected.postMessage(value instanceof ArrayBuffer ? value : JSON.stringify(value));
+      },
+      postFrames(buffer, boundaries) {
+        let start = 0;
+        for (const end of boundaries) {
+          injected.postMessage(buffer.slice(start, end));
+          start = end;
         }
       },
     };
@@ -1771,10 +2045,14 @@ function runBridge(origin, fast, bootstrap) {
       adapter.onmessage?.({ data });
     };
     // Native clients expect the authenticated init before any status or data.
-    injected.postMessage(JSON.stringify({ t: 'tproxy-android-init', v: 1, nonce: fragment }));
-    start(adapter);
+    try {
+      injected.postMessage(JSON.stringify({ t: 'tproxy-android-init', v: 1, nonce: fragment }));
+      start(adapter);
+    } catch {
+      adapter.close();
+      shutdown();
+    }
   }
-  addEventListener('pagehide', shutdown, { once: true });
 }
 
 
@@ -1801,9 +2079,10 @@ function bridgeResponse(host, boot, fast) {
   ].join('; '), permissions + ', clipboard-read=(), clipboard-write=()');
 }
 
-function portalResponse(host, secret, request, diagnostics, signedIn = false) {
+function portalResponse(host, secret, request, diagnostics) {
   const nonce = b64(random(18));
-  const csp = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action " + (signedIn ? "'self'; " : "'none'; ") +
+  const csp = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; " +
+    (diagnostics ? "connect-src 'self'; " : '') +
     "script-src 'nonce-" + nonce + "'; style-src 'nonce-" + nonce + "'";
   const link = 'tg://webproxy?server=' + encodeURIComponent(host) + '&amp;secret=' + encodeURIComponent(secret);
   const details = diagnostics ? portalDiagnostics(request) : '';
@@ -1845,12 +2124,13 @@ dl{display:grid;grid-template-columns:1fr auto;gap:5px}dd{margin:0}
 <div class="actions">
   <a href="${link}" rel="noreferrer">打开 Telegram</a>
   <button type="button" id="copy">复制链接</button>
-  ${signedIn ? '<form action="' + logoutPath + '" method="post"><button type="submit">退出登录</button></form>' : ''}
+  <form action="${logoutPath}" method="post"><button type="submit">退出登录</button></form>
 </div>
 <p id="feedback" role="status"></p>
 <p class="help" id="help">请使用支持 WEB 代理的 Telegram 版本。在应用内确认添加后启用代理。若设备没有打开 Telegram，可复制链接，在应用内打开。请将此页面和代理链接保存在私密位置。</p>
-${signedIn && !diagnostics ? '<p class="help"><a href="' + adminPath + '?diagnostics=1">连接诊断</a></p>' : ''}
+${diagnostics ? '' : '<p class="help"><a href="' + adminPath + '?diagnostics=1">连接诊断</a></p>'}
 ${details}
+${diagnostics ? '<p class="help"><button type="button" id="probe">测量本机 HTTPS 往返</button></p><p id="probe-result" role="status"></p>' : ''}
 </main>
 <script nonce="${nonce}">
 document.getElementById('copy').addEventListener('click', async () => {
@@ -1865,27 +2145,54 @@ document.getElementById('copy').addEventListener('click', async () => {
     status.textContent = '链接已选中，请手动复制';
   }
 });
+${diagnostics ? `document.getElementById('probe').addEventListener('click', async event => {
+  const button = event.currentTarget;
+  const result = document.getElementById('probe-result');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  const times = [];
+  button.disabled = true;
+  result.textContent = '正在测量…';
+  try {
+    for (let i = 0; i < 5; i++) {
+      const start = performance.now();
+      const response = await fetch('/admin?probe=1', {
+        method: 'HEAD', cache: 'no-store', credentials: 'same-origin',
+        mode: 'same-origin', redirect: 'error', signal: controller.signal,
+      });
+      if (response.status !== 204) throw Error();
+      times.push(performance.now() - start);
+    }
+    times.sort((a, b) => a - b);
+    result.textContent = '5 次 HTTPS 往返中位数 ' + Math.round(times[2]) +
+      ' ms，含浏览器请求与 Worker 鉴权。';
+  } catch {
+    result.textContent = '测量未完成，请检查网络和登录状态。';
+  } finally {
+    clearTimeout(timer);
+    button.disabled = false;
+  }
+});` : ''}
 </script>
 </body>
 </html>`;
   return htmlResponse(request.method === 'HEAD' ? null : body, csp,
-    permissions + ', clipboard-read=(), clipboard-write=(self)', { form: signedIn });
+    permissions + ', clipboard-read=(), clipboard-write=(self)', { form: true });
 }
 
 function portalDiagnostics(request) {
   const colo = request.cf?.colo ?? '';
-  const placement = request.headers.get('cf-placement') ?? '';
   const incoming = /^[A-Z]{3}$/.test(colo) ? colo : '未提供';
-  const workerPlacement = /^(?:local|remote)-[A-Z]{3}$/.test(placement) ? placement : '未提供';
   const rtt = clientRtt(request);
   const pageRtt = Number.isFinite(rtt) && rtt >= 0 ? rtt + ' ms' : '未提供';
 
   return '<details open><summary>当前实例诊断</summary>' +
-    '<p>机房和 RTT 对应本次网页请求。RTT 衡量客户端到 Cloudflare 的往返耗时。</p><dl>' +
+    '<p>机房和 RTT 来自本次管理页请求的 Cloudflare 元数据，反映该请求的接入位置与往返耗时。</p><dl>' +
     '<dt>接入机房（colo）</dt><dd>' + incoming + '</dd>' +
-    '<dt>Worker 放置（cf-placement）</dt><dd>' + workerPlacement + '</dd>' +
     '<dt>客户端到 Cloudflare RTT</dt><dd>' + pageRtt + '</dd></dl>' +
     '<p>以下采样来自本实例已接受或建连成功的代理连接。P95 按区间显示。</p><dl>' +
+    '<dt>Bridge 配置与密钥准备</dt><dd>' + timingSummary(timings.bridgeConfig) + '</dd>' +
+    '<dt>Worker 处理 Bridge 页面</dt><dd>' + timingSummary(timings.bridgePage) + '</dd>' +
     '<dt>代理升级请求的入口 RTT</dt><dd>' + timingSummary(timings.client) + '</dd>' +
     '<dt>Worker 处理 WebSocket 升级</dt><dd>' + timingSummary(timings.upgrade) + '</dd>' +
     '<dt>Worker 到 KWS 建连</dt><dd>' + timingSummary(timings.kws) + '</dd>' +
@@ -1897,7 +2204,8 @@ function portalDiagnostics(request) {
     '<p>计数仅覆盖处理本次页面请求的实例，实例重启时清零。</p><dl>' +
     Object.entries(counters).sort(([a], [b]) => a.localeCompare(b))
       .map(([kind, value]) => '<dt>' + kind + '</dt><dd>' + value + '</dd>').join('') +
-    '<dt>活动连接</dt><dd>' + activeLanes + '</dd><dt>应用缓冲字节数</dt><dd>' + queuedBytes + '</dd></dl></details>';
+    '<dt>活动连接</dt><dd>' + activeLanes + '</dd><dt>应用记账缓冲字节数</dt><dd>' + queuedBytes + '</dd></dl>' +
+    '<p>缓冲字节数为应用记账，实例总内存由 Cloudflare 运行时统计。</p></details>';
 }
 
 function publicHomeResponse(method) {
@@ -1949,6 +2257,6 @@ function publicPage(method, title, content, form = false, status = 200) {
 }
 
 export {
-  advanceCounter, configuration, connectKWS, createCTR, encodeFrame, issueToken,
-  Lane, makeHead, packetSize, readHead, verifyBridge, verifyToken, visitFrames,
+  advanceCounter, configuration, connectKWS, createCTR, createWorker, encodeFrame, issueToken,
+  Lane, makeHead, packetSize, readHead, UpstreamRouter, verifyBridge, verifyToken, visitFrames,
 };

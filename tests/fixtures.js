@@ -5,6 +5,7 @@ export const ORIGIN = 'https://' + HOST;
 export const VECTOR = 'cF3iQgotmFPcdnqmM642-vNpdfk-WLl8e50OXWBuxBQ';
 export const PROXY_SECRET = 'f7113e191685fefc9ae763a6d4e77c1f';
 export const ENV = {
+  p: 'synthetic-case-1',
   PORTAL_KEY: '29ea5f6692816233fd6716b5728035fe' + '30349835161228520064a5015a2a50af',
 };
 export const HELLO = Uint8Array.of(16, 0, 0, 0, 0, 0, 0, 1, 1);
@@ -68,11 +69,10 @@ export function independentCTR(head, secret, reverse) {
   return createCipheriv('aes-256-ctr', derived, material.subarray(32));
 }
 
-export function transportFixture(mode = 0xdd, dc = -2) {
+export function transportFixture(mode = 0xdd, dc = -2, secret = Buffer.from(PROXY_SECRET, 'hex')) {
   const head = Buffer.from(Array.from({ length: 64 }, (_, i) => (i * 13 + 23) & 255));
   head.fill(mode, 56, 60);
   head.writeInt16LE(dc, 60);
-  const secret = Buffer.from(PROXY_SECRET, 'hex');
   const toWorker = independentCTR(head, secret, false);
   const fromWorker = independentCTR(head, secret, true);
   const wire = toWorker.update(head);

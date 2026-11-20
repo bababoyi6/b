@@ -4,6 +4,7 @@ import worker, { encodeFrame } from '../telegram_webproxy.js';
 
 const base = 'https://proxy.example.com';
 const env = {
+  p: 'synthetic-case-1',
   PORTAL_KEY: '29ea5f6692816233fd6716b5728035fe30349835161228520064a5015a2a50af',
 };
 const HELLO = Uint8Array.of(16, 0, 0, 0, 0, 0, 0, 1, 1);
@@ -86,10 +87,49 @@ async function create(inline = false) {
   return result.headers.get('X-Session-Token');
 }
 
+it('signs in, serves concurrent Bridges and upgrades using only the password in workerd', async () => {
+  const host = 'dashboard.example.com';
+  const origin = 'https://' + host;
+  const configuration = { p: 'synthetic-dashboard-password' };
+  // Password-only vector derived independently with Node's PBKDF2/HKDF.
+  const capability = '2w8TO5ICl4qQE8JmSUukADb63tfkZGdvlFne8wHXdbk';
+  const request = () => new Request(origin + '/?bridge=' + capability);
+  const bridges = await Promise.all(Array.from({ length: 4 }, () => worker.fetch(request(), configuration)));
+  expect(bridges.map(response => response.status)).toEqual([200, 200, 200, 200]);
+  const login = await worker.fetch(new Request(origin + '/admin', {
+    method: 'POST', headers: { Origin: origin },
+    body: new URLSearchParams({ password: configuration.p }),
+  }), configuration);
+  expect(login.status).toBe(303);
+  const page = await worker.fetch(new Request(origin + '/admin', {
+    headers: { Cookie: login.headers.get('Set-Cookie').split(';', 1)[0] },
+  }), configuration);
+  expect(await page.text()).toContain('&amp;secret=cff9db686d249771b43ec0b598ce8982');
+  const ticket = /"ticket":"([A-Za-z0-9_-]{43})"/.exec(await bridges[0].text())[1];
+  const protocol = 'tproxy-lane-v1.' + ticket + '.1';
+  const upgrade = await worker.fetch(new Request(origin + '/api/v1/ws', {
+    headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': protocol },
+  }), configuration);
+  expect(upgrade.status).toBe(101);
+  expect(upgrade.headers.get('Sec-WebSocket-Protocol')).toBe(protocol);
+  const socket = upgrade.webSocket;
+  socket.accept();
+  socket.close();
+});
+
 function open(token, sid, origin = base) {
   return worker.fetch(new Request(base + '/api/v1/ws', { headers: {
     Upgrade: 'websocket', Origin: origin, 'Sec-WebSocket-Protocol': 'tproxy-lane-v1.' + token + '.' + sid,
   } }), env);
+}
+
+async function adminCookie() {
+  const login = await worker.fetch(new Request(base + '/admin', {
+    method: 'POST', headers: { Origin: base, 'CF-Connecting-IP': '192.0.2.33' },
+    body: new URLSearchParams({ password: env.p }),
+  }), env);
+  expect(login.status).toBe(303);
+  return login.headers.get('Set-Cookie').split(';', 1)[0];
 }
 
 it('loads the single module under workerd and authenticates portal, Bridge and the lane upgrade', async () => {
@@ -97,7 +137,10 @@ it('loads the single module under workerd and authenticates portal, Bridge and t
   expect(home.status).toBe(200);
   expect(await home.text()).toContain('Welcome to nginx!');
   expect((await worker.fetch(new Request(base + '/' + env.PORTAL_KEY), {})).status).toBe(404);
-  expect((await worker.fetch(new Request(base + '/' + env.PORTAL_KEY), env)).status).toBe(200);
+  expect((await worker.fetch(new Request(base + '/' + env.PORTAL_KEY), env)).status).toBe(404);
+  expect((await worker.fetch(new Request(base + '/?bridge=' + VECTOR), { PORTAL_KEY: env.PORTAL_KEY })).status).toBe(404);
+  const admin = await worker.fetch(new Request(base + '/admin', { headers: { Cookie: await adminCookie() } }), env);
+  expect(await admin.text()).toContain(PROXY_SECRET);
   const ticket = await create(true);
   expect((await open(ticket, 9, 'https://other.example.com')).status).toBe(404);
   expect((await open(ticket, '09')).status).toBe(404);
@@ -152,7 +195,9 @@ it('streams through real workerd sockets to a mock binary KWS upgrade and closes
     expect(event.data.byteLength).toBe(64);
     expect(wsFetch).toHaveBeenCalledTimes(1);
     expect(wsFetch.mock.calls[0][0]).toBe('https://kws3-1.web.telegram.org/apiws');
-    const diagnostics = await worker.fetch(new Request(base + '/' + env.PORTAL_KEY + '?diagnostics=1'), env);
+    const diagnostics = await worker.fetch(new Request(base + '/admin?diagnostics=1', {
+      headers: { Cookie: await adminCookie() },
+    }), env);
     const details = await diagnostics.text();
     expect(details).toMatch(/Worker 处理 WebSocket 升级<\/dt><dd>\d+ 次，P95/);
     expect(details).toMatch(/Worker 到 KWS 建连<\/dt><dd>\d+ 次，P95/);
@@ -179,7 +224,7 @@ it('blocks new lanes after local DELETE and closes an existing lane at its next 
     expect((await open(ticket, 46)).status).toBe(404);
     const closed = new Promise(resolve => socket.addEventListener('close', resolve, { once: true }));
     socket.send(encodeFrame(1, 45));
-    expect((await closed).code).toBe(1000);
+    expect((await closed).code).toBe(4001);
   } finally {
     socket.close();
   }

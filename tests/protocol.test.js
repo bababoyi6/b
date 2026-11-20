@@ -68,8 +68,8 @@ it('allows password setup and keeps portal sessions separate from stable proxy c
   expect(logout.headers.get('Set-Cookie')).toContain('Max-Age=0');
   expect(logout.headers.get('Location')).toBe('/');
 
-  const legacy = { ...ENV, PORTAL_PASSWORD: password };
-  expect((await login(legacy)).status).toBe(303);
+  const legacy = { PORTAL_KEY: ENV.PORTAL_KEY, PORTAL_PASSWORD: password };
+  expect((await login(legacy)).status).toBe(404);
   expect((await login({ ...legacy, p: rotated.p })).status).toBe(401);
 
   const ip = '192.0.2.6';
@@ -127,6 +127,7 @@ it('signs in with only a password when the Worker source has been prepared for t
   expect(body).not.toContain(ENV.PORTAL_KEY);
   expect((await dashboardConfiguration({ p: 'rotated-dashboard-password' }, HOST)).secret).toBe(PROXY_SECRET);
   expect((await dashboard.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), env)).status).toBe(200);
+  expect((await dashboard.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), {})).status).toBe(404);
 });
 
 it('lets the first login retry after a temporary storage error', async () => {
@@ -157,6 +158,61 @@ it('lets the first login retry after a temporary storage error', async () => {
 });
 
 afterEach(() => vi.restoreAllMocks());
+
+it.each([15, 16, 17])('applies the p length boundary and expires admin cookies (%i)', async length => {
+  const origin = 'https://password-boundary.example.com';
+  const env = { p: 'a'.repeat(length) };
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(1_790_000_000_000);
+  const login = await worker.fetch(new Request(origin + '/admin', {
+    method: 'POST', headers: { Origin: origin, 'CF-Connecting-IP': '192.0.2.90' },
+    body: new URLSearchParams({ password: env.p }),
+  }), env);
+  if (length < 16) {
+    expect(login.status).toBe(404);
+    return;
+  }
+  expect(login.status).toBe(303);
+  const Cookie = login.headers.get('Set-Cookie').split(';', 1)[0];
+  const manage = async () => (await worker.fetch(new Request(origin + '/admin', { headers: { Cookie } }), env)).text();
+  clock.mockReturnValue(1_790_001_799_000);
+  expect(await manage()).toContain('tg://webproxy');
+  clock.mockReturnValue(1_790_001_800_000);
+  expect(await manage()).not.toContain('tg://webproxy');
+});
+
+it('shares password derivation per host and evicts a rejected crypto result', async () => {
+  const derive = vi.spyOn(crypto.subtle, 'deriveBits');
+  const config = { p: 'synthetic-concurrent-configuration' };
+  const host = 'concurrent.example.com';
+  const concurrent = await Promise.all(Array.from({ length: 8 }, () => configuration(config, host)));
+  expect(new Set(concurrent).size).toBe(1);
+  expect(derive.mock.calls.map(([algorithm]) => algorithm.name)).toEqual(['PBKDF2', 'HKDF', 'HKDF']);
+  const alternate = await configuration(config, 'alternate.example.com');
+  expect(alternate.secret).not.toBe(concurrent[0].secret);
+  expect(await configuration(config, host)).toBe(concurrent[0]);
+
+  const rotated = { p: 'synthetic-rotated-configuration' };
+  derive.mockRejectedValueOnce(new Error('synthetic crypto failure'));
+  const failed = await Promise.allSettled([configuration(rotated, host), configuration(rotated, host)]);
+  expect(failed.map(result => result.status)).toEqual(['rejected', 'rejected']);
+  const replacement = await configuration(rotated, host);
+  expect(replacement.secret).not.toBe(concurrent[0].secret);
+  expect((await configuration(config, host)).secret).toBe(concurrent[0].secret);
+});
+
+it('rederives the same host-specific keys after cache eviction', async () => {
+  const env = { p: 'synthetic-cache-eviction' };
+  const host = 'evicted.example.com';
+  const before = await configuration(env, host);
+  for (let index = 0; index < 8; index++) await configuration(env, `new-${index}.example.com`);
+  const derive = vi.spyOn(crypto.subtle, 'deriveBits');
+  const restored = await configuration(env, host);
+  expect(restored).not.toBe(before);
+  expect(restored.secret).toBe(before.secret);
+  expect(derive.mock.calls.map(([algorithm]) => algorithm.name)).toEqual(['PBKDF2', 'HKDF', 'HKDF']);
+  expect(await configuration(env, host)).toBe(restored);
+  expect(derive).toHaveBeenCalledTimes(3);
+});
 
 describe('MTProto and WEB Proxy wire formats', () => {
   it.each([
@@ -211,6 +267,14 @@ describe('MTProto and WEB Proxy wire formats', () => {
     expect([...carry]).toEqual([0x7f, 0, 1, 0, 1]);
   });
 
+  it('observes a failed prewarmed key import even before its first use', async () => {
+    const failed = new Error('synthetic key import failure');
+    vi.spyOn(crypto.subtle, 'importKey').mockRejectedValueOnce(failed);
+    const crypt = createCTR(new Uint8Array(32), new Uint8Array(16));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await expect(crypt(Uint8Array.of(1))).rejects.toBe(failed);
+  });
+
   it.each([0xef, 0xee, 0xdd])('preserves mode 0x%s and signed DC, with valid framing', mode => {
     const head = makeHead({ mode, dc: 5, media: true });
     expect(readHead(head)).toEqual({ mode, dc: 5, media: true });
@@ -243,30 +307,63 @@ async function cryptAfter(first, crypt) {
 }
 
 describe('carrier authentication', () => {
+  it('rejects malformed carrier headers before deriving the cold host key', async () => {
+    const cfg = await configuration(ENV, HOST);
+    const expires = Math.floor(Date.now() / 1000) + 60;
+    const boot = await issueToken(cfg, HOST, 1, expires, new Uint8Array(12));
+    const ticket = await issueToken(cfg, HOST, 2, expires, new Uint8Array(12));
+    const cold = 'https://cold-headers.example.com';
+    const env = { p: 'synthetic-cold-headers-password' };
+    const derive = vi.spyOn(crypto.subtle, 'deriveBits');
+    for (const request of [
+      new Request(cold + '/api/v1/session', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + boot, 'Content-Type': 'text/plain' }, body: HELLO,
+      }),
+      new Request(cold + '/api/v1/session', {
+        method: 'POST', headers: { Authorization: 'Bearer ' + boot, 'Content-Type': 'application/octet-stream', 'Content-Length': '1000' }, body: HELLO,
+      }),
+      new Request(cold + '/api/v1/ws', {
+        headers: { Upgrade: 'websocket', 'Sec-WebSocket-Version': '12', 'Sec-WebSocket-Protocol': 'tproxy-lane-v1.' + ticket + '.1' },
+      }),
+    ]) {
+      const response = await worker.fetch(request, env);
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe('');
+    }
+    expect(derive).not.toHaveBeenCalled();
+  });
+
   it('protects the portal and separates it from Bridge authentication', async () => {
-    const response = await worker.fetch(new Request(ORIGIN + '/' + ENV.PORTAL_KEY), ENV);
+    const login = await worker.fetch(new Request(ORIGIN + '/admin', {
+      method: 'POST', headers: { Origin: ORIGIN, 'CF-Connecting-IP': '192.0.2.71' },
+      body: new URLSearchParams({ password: ENV.p }),
+    }), ENV);
+    expect(login.status).toBe(303);
+    const cookie = login.headers.get('Set-Cookie').split(';', 1)[0];
+    const response = await worker.fetch(new Request(ORIGIN + '/admin', { headers: { Cookie: cookie } }), ENV);
     const html = await response.text();
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe('no-store');
-    expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(response.headers.get('referrer-policy')).toBe('same-origin');
     expect(response.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
     expect(html).toContain('tg://webproxy?server=proxy.example.com&amp;secret=' + PROXY_SECRET);
     expect(html).not.toContain('382abaf798ad5db247fdccdb3fd6521d8c99ced045d85ff689a997a6a4baec88');
     expect(html).not.toContain(ENV.PORTAL_KEY);
     expect(html).not.toContain('当前实例诊断');
-    const diagnostic = new Request(ORIGIN + '/' + ENV.PORTAL_KEY + '?diagnostics=1', {
-      headers: { 'cf-placement': 'remote-NRT' },
+    const diagnostic = new Request(ORIGIN + '/admin?diagnostics=1', {
+      headers: { Cookie: cookie, 'cf-placement': 'remote-NRT' },
     });
     Object.defineProperty(diagnostic, 'cf', { value: { colo: 'HKG', clientTcpRtt: 42 } });
     const debug = await worker.fetch(diagnostic, ENV);
     const details = await debug.text();
     expect(details).toContain('当前实例诊断');
     expect(details).toContain('接入机房（colo）</dt><dd>HKG');
-    expect(details).toContain('Worker 放置（cf-placement）</dt><dd>remote-NRT');
+    expect(details).not.toContain('remote-NRT');
+    expect(details).toContain('应用记账缓冲字节数');
     expect(details).toContain('客户端到 Cloudflare RTT</dt><dd>42 ms');
     expect(details).toContain('代理升级请求的入口 RTT');
     expect(details).toContain('Worker 到 KWS 建连');
-    const head = await worker.fetch(new Request(ORIGIN + '/' + ENV.PORTAL_KEY, { method: 'HEAD' }), ENV);
+    const head = await worker.fetch(new Request(ORIGIN + '/admin', { method: 'HEAD', headers: { Cookie: cookie } }), ENV);
     expect(await head.text()).toBe('');
     const bridge = await worker.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), ENV);
     expect(await bridge.text()).not.toContain(PROXY_SECRET);
@@ -321,7 +418,7 @@ describe('carrier authentication', () => {
     }
   });
 
-  it('derives stable, host-specific keys from only PORTAL_KEY and rejects invalid access codes', async () => {
+  it('keeps saved seeds compatible with valid p and rejects invalid seeds', async () => {
     for (const bad of [{}, { PORTAL_KEY: '' }, { PORTAL_KEY: 'short' },
       { PORTAL_KEY: ENV.PORTAL_KEY + ' ' }, { PORTAL_KEY: 'z'.repeat(64) }]) {
       expect(await configuration(bad, HOST)).toBeNull();
@@ -331,9 +428,40 @@ describe('carrier authentication', () => {
     expect(cfg.secret).toBe(PROXY_SECRET);
     expect((await configuration(ENV, 'other.example.com')).secret).not.toBe(PROXY_SECRET);
     expect((await configuration({ PORTAL_KEY: ENV.PORTAL_KEY.toUpperCase() }, HOST)).secret).toBe(PROXY_SECRET);
-    const rotated = { PORTAL_KEY: 'a3' + ENV.PORTAL_KEY.slice(2) };
+    const rotated = { ...ENV, PORTAL_KEY: 'a3' + ENV.PORTAL_KEY.slice(2) };
     expect((await configuration(rotated, HOST)).secret).not.toBe(PROXY_SECRET);
     expect((await worker.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), rotated)).status).toBe(404);
+  });
+
+  it('rejects real capabilities and tickets when p is missing or invalid', async () => {
+    const boot = await bridgeBoot(worker);
+    const session = await worker.fetch(authRequest('/api/v1/session', boot, HELLO), ENV);
+    expect(session.status).toBe(200);
+    const ticket = session.headers.get('X-Session-Token');
+    const renewal = session.headers.get('X-Session-Renewal');
+    const derive = vi.spyOn(crypto.subtle, 'deriveBits');
+    for (const env of [
+      { PORTAL_KEY: ENV.PORTAL_KEY },
+      { PORTAL_KEY: ENV.PORTAL_KEY, PORTAL_PASSWORD: ENV.p },
+      { PROXY_SEED: ENV.PORTAL_KEY, p: ENV.p.slice(0, 15) },
+      { PROXY_SEED: ENV.PORTAL_KEY, p: '界'.repeat(86) },
+    ]) {
+      for (const request of [
+        new Request(ORIGIN + '/admin'),
+        new Request(ORIGIN + '/?bridge=' + VECTOR),
+        authRequest('/api/v1/session', boot, HELLO),
+        authRequest('/api/v1/session', ticket, null, 'DELETE'),
+        authRequest('/api/v1/session/renew', renewal),
+        new Request(ORIGIN + '/api/v1/ws', { headers: {
+          Upgrade: 'websocket', 'Sec-WebSocket-Protocol': 'tproxy-lane-v1.' + ticket + '.1',
+        } }),
+      ]) {
+        const response = await worker.fetch(request, env);
+        expect(response.status).toBe(404);
+        expect(await response.text()).toBe('');
+      }
+    }
+    expect(derive).not.toHaveBeenCalled();
   });
 
   it('rejects raw keys, wrong purpose, expired, forged and cross-host credentials', async () => {
@@ -379,6 +507,59 @@ describe('carrier authentication', () => {
     expect((await worker.fetch(authRequest('/api/v1/session/renew', grant), ENV)).status).toBe(404);
     clock.mockReturnValue(start + 13 * 3600_000);
     expect((await worker.fetch(authRequest('/api/v1/session/renew', grant), ENV)).status).toBe(404);
+  });
+
+  it('validates a grant in a fresh isolate and refuses it at the absolute parent deadline', async () => {
+    const start = 1_791_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    const boot = await bridgeBoot(worker);
+    const create = (instance, token) => instance.fetch(authRequest('/api/v1/session', token, HELLO), ENV);
+    const initial = await create(worker, boot);
+    expect(initial.status).toBe(200);
+    const grant = initial.headers.get('X-Session-Renewal');
+    const source = readFileSync(new URL('../telegram_webproxy.js', import.meta.url));
+    const url = 'data:text/javascript;base64,' + source.toString('base64');
+    const { default: fresh, configuration: cfg } = await import(/* @vite-ignore */ url + '#fresh-isolate');
+    const renew = () => fresh.fetch(authRequest('/api/v1/session/renew', grant), ENV);
+    const deadline = start + (120 + 12 * 3600) * 1000;
+    clock.mockReturnValue(deadline - 1000);
+    const last = await renew();
+    expect(last.status).toBe(204);
+    expect(last.headers.get('X-Session-TTL')).toBe('1');
+    const ticket = last.headers.get('X-Session-Token');
+    const keys = await cfg(ENV, HOST);
+    expect(await verifyToken(keys, HOST, 2, ticket)).toBeTruthy();
+    clock.mockReturnValue(deadline);
+    expect((await renew()).status).toBe(404);
+    expect(await verifyToken(keys, HOST, 2, ticket)).toBeNull();
+    clock.mockReturnValue(deadline + 1000);
+    expect((await renew()).status).toBe(404);
+    expect((await create(fresh, boot)).status).toBe(404);
+    const replacement = await create(fresh, await bridgeBoot(fresh));
+    expect(replacement.status).toBe(200);
+    expect(replacement.headers.get('X-Session-Renewal')).not.toBe(grant);
+  });
+
+  it('rejects a renewal whose ticket finishes signing after the parent expires', async () => {
+    const start = 1_792_000_000_000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(start);
+    const boot = await bridgeBoot(worker);
+    const session = await worker.fetch(authRequest('/api/v1/session', boot, HELLO), ENV);
+    expect(session.status).toBe(200);
+    const grant = session.headers.get('X-Session-Renewal');
+    const deadline = start + (120 + 12 * 3600) * 1000;
+    clock.mockReturnValue(deadline - 1000);
+    const nativeSign = crypto.subtle.sign.bind(crypto.subtle);
+    let signs = 0;
+    vi.spyOn(crypto.subtle, 'sign').mockImplementation(async (...args) => {
+      const signed = await nativeSign(...args);
+      if (++signs === 2) clock.mockReturnValue(deadline);
+      return signed;
+    });
+    const response = await worker.fetch(authRequest('/api/v1/session/renew', grant), ENV);
+    expect(signs).toBe(2);
+    expect(response.status).toBe(404);
+    expect(response.headers.has('X-Session-Token')).toBe(false);
   });
 
   it('bounds HELLO buffers and rejects cookies, incompatible origins, invalid bodies and query strings', async () => {

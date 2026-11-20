@@ -1,9 +1,16 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { availableParallelism } from 'node:os';
-import { Lane, encodeFrame, visitFrames } from '../telegram_webproxy.js';
+import { pathToFileURL } from 'node:url';
+import { encodeFrame, visitFrames } from '../telegram_webproxy.js';
+import { createTCPEngine } from '../experiments/tcp.mjs';
 import { FakeSocket, independentCTR, packet, syntheticGroup, transportFixture, until, windowFrame } from '../tests/fixtures.js';
 
 const ORIGINAL = 'e565c57ff58656fd544755f67e1c266148c0b88f';
+const candidatePath = process.argv.find(arg => arg.startsWith('--candidate='))?.slice('--candidate='.length);
+const candidateURL = candidatePath ? pathToFileURL(candidatePath) : new URL('../telegram_webproxy.js', import.meta.url);
+const { Lane } = await import(candidateURL.href);
+const verifyPayload = process.argv.includes('--verify');
 const compare = process.argv.find(arg => arg.startsWith('--against='));
 let baseline = null;
 let BaselineLane, mkSession;
@@ -24,7 +31,16 @@ const workloads = [
   ['交互与媒体', [[160, 124, 1], [64, 65532, 8], [96, 8188, 12]]],
   ['连续大块', [[96, 131068, 8]]],
   ['512 KiB 媒体包', [[32, 524284, 2]]],
+  ['持续下载', [[128, 131068, 8, 'down']]],
+  ['持续上传', [[64, 524284, 4, 'up']]],
 ];
+if (process.argv.includes('--sizes')) {
+  for (const size of [1024, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024]) {
+    workloads.push([size / 1024 + ' KiB 下载', [[64, size - 4, size >= 1024 * 1024 ? 2 : 8, 'down']]]);
+  }
+  workloads.push(['1024 KiB 上传', [[32, 1024 * 1024 - 4, 2, 'up']]]);
+  workloads.push(['慢客户端持续下载', [[64, 128 * 1024 - 4, 8, 'down', true]]]);
+}
 
 class Socket extends FakeSocket {
   sentBytes = 0;
@@ -35,6 +51,29 @@ class Socket extends FakeSocket {
     if (this.sends++ === 0) this.head = Buffer.from(value);
     this.sentBytes += value.byteLength;
     this.onSend?.(value);
+  }
+}
+
+class TCPSocket extends Socket {
+  opened = Promise.resolve();
+  closed = Promise.resolve();
+  readable = new ReadableStream({ type: 'bytes', start: controller => { this.controller = controller; } });
+  writable = new WritableStream({ write: bytes => this.send(bytes) });
+
+  constructor() {
+    super();
+    this.accept();
+  }
+
+  receive(bytes) {
+    this.controller.enqueue(Uint8Array.from(bytes));
+  }
+
+  async close() {
+    super.close();
+    const pending = this.controller.byobRequest;
+    this.controller.close();
+    pending?.respond(0);
   }
 }
 
@@ -56,17 +95,24 @@ function openFixture() {
   });
 }
 
-async function start(version, id, [count, size, burst]) {
+async function start(version, id, [count, size, burst, direction, slow = false]) {
+  const directTCP = version === 'tcp' || version === 'upstream-tcp';
   const fixture = transportFixture(0xdd, id);
   const client = new Socket();
+  const expected = verifyPayload ? createHash('sha256') : null;
+  const receivedUp = verifyPayload && direction !== 'down' ? createHash('sha256') : null;
+  const receivedDown = verifyPayload && direction !== 'up' ? createHash('sha256') : null;
   let peer, current;
-  let credit = 0, downstream = 0, wake;
+  let credit = 0, downstream = 0, queuedPayload = 0, wake;
   client.onSend = data => {
+    if (slow && data[0] === 2) client.bufferedAmount += data.byteLength;
     visitFrames(data, (type, sid, bytes, start, end) => {
       if (type === 4) credit += new DataView(bytes.buffer, bytes.byteOffset).getUint32(start);
       if (type === 2) {
         downstream += end - start;
-        client.receive(encodeFrame(4, id, windowFrame(end - start)));
+        if (receivedDown) receivedDown.update(fixture.fromWorker.update(bytes.subarray(start, end)));
+        if (slow) queuedPayload += end - start;
+        else client.receive(encodeFrame(4, id, windowFrame(end - start)));
       }
     });
     wake?.();
@@ -76,9 +122,10 @@ async function start(version, id, [count, size, burst]) {
     ready = openFixture();
     mkSession({ secret: fixture.secret, sid: id }).attach(client);
   } else {
-    peer = new Socket();
-    const Relay = version === 'upstream' ? BaselineLane : Lane;
-    current = new Relay(client, id, fixture.secret, syntheticGroup(), async () => peer);
+    peer = directTCP ? new TCPSocket() : new Socket();
+    const Relay = version.startsWith('upstream') ? BaselineLane : Lane;
+    const dial = directTCP ? createTCPEngine(() => peer) : async () => peer;
+    current = new Relay(client, id, fixture.secret, syntheticGroup(), dial, { directTCP });
     current.attach();
     ready = Promise.resolve(peer);
   }
@@ -87,45 +134,79 @@ async function start(version, id, [count, size, burst]) {
   peer = await ready;
   await until(() => peer.sends === 1 && credit === 64);
   const reverse = independentCTR(peer.head, null, true);
+  if (receivedUp) {
+    const forward = independentCTR(peer.head);
+    forward.update(peer.head); // The 64-byte obfuscation header consumes the first four blocks.
+    peer.onSend = bytes => receivedUp.update(forward.update(bytes));
+  }
   const payload = packet(Buffer.alloc(size, 47));
   const batches = [];
   for (let i = 0; i < count; i += burst) {
     const batch = [];
     for (let pos = i; pos < Math.min(count, i + burst); pos++) {
-      batch.push([encodeFrame(2, id, fixture.toWorker.update(payload)), reverse.update(payload)]);
+      let sample = payload;
+      if (expected) {
+        sample = Buffer.from(payload);
+        sample.writeUInt16LE(pos, sample.length - 2);
+        expected.update(sample);
+      }
+      batch.push([
+        direction !== 'down' ? encodeFrame(2, id, fixture.toWorker.update(sample)) : null,
+        direction !== 'up' ? reverse.update(sample) : null,
+      ]);
     }
     batches.push(batch);
   }
+  const consume = slow ? setInterval(() => {
+    const wireBytes = Math.min(client.bufferedAmount, 128 * 1024);
+    client.bufferedAmount -= wireBytes;
+    const payloadBytes = Math.min(queuedPayload, wireBytes);
+    if (!payloadBytes) return;
+    queuedPayload -= payloadBytes;
+    client.receive(encodeFrame(4, id, windowFrame(payloadBytes)));
+  }, 4) : null;
   return {
-    client, peer,
+    client, peer, budgetBytes: () => current?.group.bytes ?? 0,
     async close() {
+      clearInterval(consume);
       client.close();
       if (current) await until(() => !current.upBusy && !current.downBusy);
     },
     async replay(latencies, probe) {
-      let expected = 0;
+      let upBytes = 0, downBytes = 0;
       for (const batch of batches) {
         const time = performance.now();
-        expected += batch.length * payload.length;
+        if (direction !== 'down') upBytes += batch.length * payload.length;
+        if (direction !== 'up') downBytes += batch.length * payload.length;
         await new Promise((resolve, reject) => {
           const timer = setTimeout(() => reject(new Error('bench lane timed out')), 5000);
           wake = () => {
-            if (downstream < expected || credit < expected + 64) return;
+            if (downstream < downBytes || credit < upBytes + 64) return;
             wake = null;
             clearTimeout(timer);
             resolve();
           };
           for (const [up, down] of batch) {
-            client.receive(up);
-            peer.receive(down);
+            if (up) client.receive(up);
+            if (down) peer.receive(down);
           }
+          if (slow) probe();
         });
         latencies.push(performance.now() - time);
         probe();
       }
-      if (credit !== expected + 64 || downstream !== expected) throw new Error('byte count mismatch');
-      if (peer.sends !== count + 1) throw new Error('KWS frame boundary mismatch');
-      return downstream * 2;
+      if (slow) await until(() => client.bufferedAmount === 0);
+      if (credit !== upBytes + 64 || downstream !== downBytes) throw new Error('byte count mismatch');
+      if (peer.sentBytes !== upBytes + 64) throw new Error('upstream byte count mismatch');
+      if (!directTCP && peer.sends !== (direction === 'down' ? 1 : count + 1)) {
+        throw new Error('KWS frame boundary mismatch');
+      }
+      if (expected) {
+        const checksum = expected.digest('hex');
+        if ((receivedUp && receivedUp.digest('hex') !== checksum) ||
+            (receivedDown && receivedDown.digest('hex') !== checksum)) throw new Error('plaintext integrity mismatch');
+      }
+      return upBytes + downBytes;
     },
   };
 }
@@ -141,8 +222,11 @@ async function measure(version, spec) {
     for (const [n, lane] of spec.entries()) lanes.push(await start(version, n + 1, lane));
     globalThis.gc?.();
     const before = takeMemory();
-    let peak = before;
-    const probe = () => { peak = Math.max(peak, takeMemory()); };
+    let peak = before, peakBudget = 0;
+    const probe = () => {
+      peak = Math.max(peak, takeMemory());
+      peakBudget = Math.max(peakBudget, lanes.reduce((sum, lane) => sum + lane.budgetBytes(), 0));
+    };
     timer = setInterval(probe, 2);
     crypto.subtle.encrypt = async function (algorithm, key, input) {
       const result = await originalEncrypt.call(this, algorithm, key, input);
@@ -161,9 +245,10 @@ async function measure(version, spec) {
     return {
       MiBps: bytes / (1024 * 1024) / (elapsed / 1000),
       cpuMs: (cpu.user + cpu.system) / 1000, p50Ms: percentile(.50), p95Ms: percentile(.95),
-      peakBuffersMiB: (peak - before) / (1024 * 1024), cryptoCalls: cryptoStats.calls,
+      peakBuffersMiB: (peak - before) / (1024 * 1024), peakBudgetMiB: peakBudget / (1024 * 1024),
+      cryptoCalls: cryptoStats.calls,
       cryptoOutputMiB: cryptoStats.output / (1024 * 1024),
-      kwsSends: lanes.reduce((n, lane) => n + lane.peer.sends - 1, 0),
+      [version.endsWith('tcp') ? 'tcpWrites' : 'kwsSends']: lanes.reduce((n, lane) => n + lane.peer.sends - 1, 0),
       workerSends: lanes.reduce((n, lane) => n + lane.client.sends - 1, 0),
     };
   } finally {
@@ -175,7 +260,11 @@ async function measure(version, spec) {
 
 const rounds = process.argv.includes('--quick') ? 3 : 7;
 const variants = baseline ? ['upstream', 'candidate'] : ['candidate'];
-console.log(JSON.stringify({ node: process.version, platform: process.platform, cpus: availableParallelism(), rounds, baseline }));
+if (process.argv.includes('--tcp')) {
+  if (BaselineLane && process.argv.includes('--tcp-baseline')) variants.push('upstream-tcp');
+  variants.push('tcp');
+}
+console.log(JSON.stringify({ node: process.version, platform: process.platform, cpus: availableParallelism(), rounds, baseline, candidatePath, verifyPayload }));
 for (const [name, spec] of workloads) {
   const results = Object.fromEntries(variants.map(variant => [variant, []]));
   for (const variant of variants) await measure(variant, spec);
