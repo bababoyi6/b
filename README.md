@@ -2,6 +2,8 @@
 
 在 Cloudflare 上搭自己的 Telegram WEB 代理。你需要一个已经接入 Cloudflare 的域名，以及支持 **WEB 代理**的 Telegram 客户端。
 
+**实际运行的 Worker 文件是 `telegram_webproxy.js`。** [打开 JS 文件](./telegram_webproxy.js)
+
 ## 第一次部署
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/bababoyi6/b)
@@ -11,10 +13,6 @@
 3. 访问自己的域名会看到 **Welcome to nginx!**。打开域名后的 `/admin` 并输入密码。Worker 会在首次登录时生成并保存后台密钥。点 **打开 Telegram** 或 **复制链接**，在 Telegram 里确认添加并开启代理。
 
 用命令行部署时，在项目目录运行 `npm ci` 和 `npx wrangler deploy`，然后用 `npx wrangler secret put p` 设置登录密码。[Cloudflare 密钥设置](https://developers.cloudflare.com/workers/configuration/secrets/)
-
-## 已经部署过
-
-已经有 `PORTAL_KEY` 或 `PROXY_SEED` 的用户，更新原来的 Worker 时保留已有密钥，并设置 `p`。原来在 Telegram 添加的代理链接可以继续用。旧的 `PORTAL_PASSWORD` 也可用于登录。两个都填时，以 `p` 为准。
 
 ## 遇到问题
 
