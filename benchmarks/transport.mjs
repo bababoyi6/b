@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { availableParallelism } from 'node:os';
 import { Lane, encodeFrame, visitFrames } from '../telegram_webproxy.js';
+import { createTCPEngine } from '../experiments/tcp.mjs';
 import { FakeSocket, independentCTR, packet, syntheticGroup, transportFixture, until, windowFrame } from '../tests/fixtures.js';
 
 const ORIGINAL = 'e565c57ff58656fd544755f67e1c266148c0b88f';
@@ -40,6 +41,29 @@ class Socket extends FakeSocket {
   }
 }
 
+class TCPSocket extends Socket {
+  opened = Promise.resolve();
+  closed = Promise.resolve();
+  readable = new ReadableStream({ type: 'bytes', start: controller => { this.controller = controller; } });
+  writable = new WritableStream({ write: bytes => this.send(bytes) });
+
+  constructor() {
+    super();
+    this.accept();
+  }
+
+  receive(bytes) {
+    this.controller.enqueue(Uint8Array.from(bytes));
+  }
+
+  async close() {
+    super.close();
+    const pending = this.controller.byobRequest;
+    this.controller.close();
+    pending?.respond(0);
+  }
+}
+
 function openFixture() {
   return new Promise(resolve => {
     const native = globalThis.WebSocket;
@@ -59,6 +83,7 @@ function openFixture() {
 }
 
 async function start(version, id, [count, size, burst, direction]) {
+  const directTCP = version === 'tcp';
   const fixture = transportFixture(0xdd, id);
   const client = new Socket();
   let peer, current;
@@ -78,9 +103,10 @@ async function start(version, id, [count, size, burst, direction]) {
     ready = openFixture();
     mkSession({ secret: fixture.secret, sid: id }).attach(client);
   } else {
-    peer = new Socket();
+    peer = directTCP ? new TCPSocket() : new Socket();
     const Relay = version === 'upstream' ? BaselineLane : Lane;
-    current = new Relay(client, id, fixture.secret, syntheticGroup(), async () => peer);
+    const dial = directTCP ? createTCPEngine(() => peer) : async () => peer;
+    current = new Relay(client, id, fixture.secret, syntheticGroup(), dial, { directTCP });
     current.attach();
     ready = Promise.resolve(peer);
   }
@@ -130,7 +156,10 @@ async function start(version, id, [count, size, burst, direction]) {
         probe();
       }
       if (credit !== upBytes + 64 || downstream !== downBytes) throw new Error('byte count mismatch');
-      if (peer.sends !== (direction === 'down' ? 1 : count + 1)) throw new Error('KWS frame boundary mismatch');
+      if (peer.sentBytes !== upBytes + 64) throw new Error('upstream byte count mismatch');
+      if (!directTCP && peer.sends !== (direction === 'down' ? 1 : count + 1)) {
+        throw new Error('KWS frame boundary mismatch');
+      }
       return upBytes + downBytes;
     },
   };
@@ -169,7 +198,7 @@ async function measure(version, spec) {
       cpuMs: (cpu.user + cpu.system) / 1000, p50Ms: percentile(.50), p95Ms: percentile(.95),
       peakBuffersMiB: (peak - before) / (1024 * 1024), cryptoCalls: cryptoStats.calls,
       cryptoOutputMiB: cryptoStats.output / (1024 * 1024),
-      kwsSends: lanes.reduce((n, lane) => n + lane.peer.sends - 1, 0),
+      [version === 'tcp' ? 'tcpWrites' : 'kwsSends']: lanes.reduce((n, lane) => n + lane.peer.sends - 1, 0),
       workerSends: lanes.reduce((n, lane) => n + lane.client.sends - 1, 0),
     };
   } finally {
@@ -181,6 +210,7 @@ async function measure(version, spec) {
 
 const rounds = process.argv.includes('--quick') ? 3 : 7;
 const variants = baseline ? ['upstream', 'candidate'] : ['candidate'];
+if (process.argv.includes('--tcp')) variants.push('tcp');
 console.log(JSON.stringify({ node: process.version, platform: process.platform, cpus: availableParallelism(), rounds, baseline }));
 for (const [name, spec] of workloads) {
   const results = Object.fromEntries(variants.map(variant => [variant, []]));

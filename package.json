@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "test": "vitest run --config vitest.config.js",
-    "test:runtime": "vitest run --config vitest.workers.config.js",
+    "test:runtime": "npm run build:pages && node scripts/verify-pages.mjs && vitest run --config vitest.workers.config.js",
+    "build:pages": "node scripts/build-pages.mjs",
     "bench": "node --expose-gc benchmarks/transport.mjs",
     "bench:startup": "node benchmarks/startup.mjs"
   },

@@ -381,16 +381,20 @@ function timingSummary(histogram) {
   return samples + ' 次，P95 ' + bound + ' ms';
 }
 
-export default {
-  async fetch(request, env) {
-    try {
-      return await route(request, env);
-    } catch {
-      count('request');
-      return unavailable();
-    }
-  },
-};
+function createWorker(dial = dialKWS, directTCP = false) {
+  return {
+    async fetch(request, env) {
+      try {
+        return await route(request, env, dial, directTCP);
+      } catch {
+        count('request');
+        return unavailable();
+      }
+    },
+  };
+}
+
+export default createWorker();
 
 
 function sessionID(bootstrap) {
@@ -475,19 +479,21 @@ async function routePortal(request, env, url, host) {
     token.set(await portalSessionMAC(cfg, host, password, token.subarray(0, 16)), 16);
     return portalRedirect(adminPath, b64(token), PORTAL_LIFETIME);
   }
-  if (!read || (search && search !== '?diagnostics=1')) return unavailable();
+  const probe = search === '?probe=1' && method === 'HEAD';
+  if (!read || (search && search !== '?diagnostics=1' && !probe)) return unavailable();
   const cookies = (headers.get('Cookie') ?? '').split(';').map(value => value.trim())
     .filter(value => value.startsWith(portalCookie + '='));
   const token = cookies.length === 1 && decodeToken(cookies[0].slice(portalCookie.length + 1));
-  if (!token || view(token).getUint32(0) <= now()) return loginResponse(method);
+  if (!token || view(token).getUint32(0) <= now()) return probe ? unavailable() : loginResponse(method);
   const cfg = await configuration(env, host);
   if (!cfg || !equalBytes(token.subarray(16), await portalSessionMAC(cfg, host, password, token.subarray(0, 16)))) {
-    return loginResponse(method);
+    return probe ? unavailable() : loginResponse(method);
   }
+  if (probe) return new Response(null, { status: 204, headers: noStore });
   return portalResponse(host, cfg.secret, request, Boolean(search), true);
 }
 
-async function route(request, env) {
+async function route(request, env, dial, directTCP) {
   const url = new URL(request.url);
   const host = canonicalHost(url);
   if (!host) return unavailable();
@@ -545,7 +551,7 @@ async function route(request, env) {
   }
   const auth = await authenticateToken(cfg, host, purpose, claims);
   if (!auth) return unavailable();
-  if (upgrade) return upgradeLane(request, cfg, host, upgrade, auth, started);
+  if (upgrade) return upgradeLane(request, cfg, host, upgrade, auth, started, dial, directTCP);
   const deadline = view(auth.id).getUint32(0);
   const key = groupKey(host, auth.id);
   if (method === 'DELETE') {
@@ -584,7 +590,7 @@ function parseLaneProtocol(headers) {
   return { protocol, token: match[1], sid: Number(match[2]) };
 }
 
-function upgradeLane(request, cfg, host, { protocol, sid }, auth, started) {
+function upgradeLane(request, cfg, host, { protocol, sid }, auth, started, dial, directTCP) {
   const group = getGroup(groupKey(host, auth.id), view(auth.id).getUint32(0));
   if (group?.deleted || group?.used.has(sid)) return unavailable();
   if (!group || group.used.size >= 4096 || group.active >= 64 ||
@@ -598,7 +604,7 @@ function upgradeLane(request, cfg, host, { protocol, sid }, auth, started) {
   const release = () => { group.active--; activeLanes--; };
   let lane;
   try {
-    lane = new Lane(server, sid, cfg.proxyKey, group, connectKWS, { release });
+    lane = new Lane(server, sid, cfg.proxyKey, group, dial, { release, directTCP });
     lane.attach();
     const response = new Response(null, { status: 101, webSocket: client, headers: {
       ...noStore, 'Sec-WebSocket-Protocol': protocol, 'Sec-WebSocket-Extensions': '',
@@ -692,7 +698,7 @@ function readHead(head) {
   return { mode, dc: Math.abs(dc), media: dc < 0 };
 }
 
-function makeHead({ mode, dc, media }) {
+function makeHead({ mode, dc, media }, directTCP = false) {
   const head = new Uint8Array(64);
   const header = view(head);
   const forbidden = [0x48454144, 0x504f5354, 0x47455420, 0x4f505449, 0xeeeeeeee, 0xdddddddd, 0x16030102];
@@ -700,7 +706,7 @@ function makeHead({ mode, dc, media }) {
     crypto.getRandomValues(head);
   } while (head[0] === 0xef || forbidden.includes(header.getUint32(0)) || !header.getUint32(4));
   head.fill(mode, 56, 60);
-  header.setInt16(60, media ? -dc : dc, true);
+  if (!directTCP) header.setInt16(60, media ? -dc : dc, true);
   return head;
 }
 
@@ -823,7 +829,57 @@ function releaseUpgrade(response) {
 const MAX_PARALLEL_BACKUPS = 8;
 let parallelBackups = 0;
 
-async function attemptKWS(host, attempt, fetcher, timeout) {
+// Each route keeps state for its two official endpoints only. A new isolate
+// starts with the protocol's original control/media preference.
+class UpstreamRouter {
+  paths = Array.from({ length: 10 }, () => Array.from({ length: 2 }, () => ({
+    failures: 0, lastFailure: 0, retryAt: 0, serial: 0, latestSuccess: 0,
+  })));
+
+  constructor(clock = Date.now) {
+    this.clock = clock;
+  }
+
+  path({ dc, media }, candidate) {
+    return this.paths[(dc - 1) * 2 + Number(media)][candidate];
+  }
+
+  plan(info) {
+    const primary = this.path(info, 0).retryAt;
+    const alternate = this.path(info, 1).retryAt;
+    return primary > this.clock() && primary > alternate ? [1, 0] : [0, 1];
+  }
+
+  canHedge(info, candidate) {
+    return this.path(info, candidate).retryAt <= this.clock();
+  }
+
+  start(info, candidate) {
+    const path = this.path(info, candidate);
+    const generation = ++path.serial;
+    const time = this.clock();
+    if (path.retryAt && path.retryAt <= time) path.retryAt = time + 5000;
+    return success => {
+      const completed = this.clock();
+      if (success) {
+        path.latestSuccess = Math.max(path.latestSuccess, generation);
+        path.failures = path.retryAt = 0;
+      } else if (generation > path.latestSuccess) {
+        path.failures = completed - path.lastFailure <= 30000 ? path.failures + 1 : 1;
+        path.lastFailure = completed;
+        if (path.failures >= 2) path.retryAt = completed + 15000;
+      }
+    };
+  }
+}
+
+const kwsRouter = new UpstreamRouter();
+
+function dialKWS(info, signal) {
+  return connectKWS(info, signal, fetch, 3000, 900, kwsRouter);
+}
+
+async function attemptKWS(host, attempt, fetcher, timeout, record) {
   const signal = attempt.signal;
   if (signal.aborted) return null;
   let wake;
@@ -831,6 +887,7 @@ async function attemptKWS(host, attempt, fetcher, timeout) {
   signal.addEventListener('abort', wake, { once: true });
   const timer = setTimeout(() => {
     count('kws-handshake-timeout');
+    record?.(false);
     attempt.abort();
   }, timeout);
   try {
@@ -846,13 +903,20 @@ async function attemptKWS(host, attempt, fetcher, timeout) {
     if (!response) return null;
     if (signal.aborted || response.status !== 101 || !response.webSocket ||
         response.headers.get('Sec-WebSocket-Protocol') !== 'binary') {
-      if (!signal.aborted) count(response.status === 101 ? 'kws-handshake-protocol' : 'kws-handshake-http');
+      if (!signal.aborted) {
+        count(response.status === 101 ? 'kws-handshake-protocol' : 'kws-handshake-http');
+        record?.(false);
+      }
       releaseUpgrade(response);
       return null;
     }
+    record?.(true);
     return response.webSocket;
   } catch {
-    if (!signal.aborted) count('kws-handshake-network');
+    if (!signal.aborted) {
+      count('kws-handshake-network');
+      record?.(false);
+    }
     return null;
   } finally {
     clearTimeout(timer);
@@ -860,13 +924,15 @@ async function attemptKWS(host, attempt, fetcher, timeout) {
   }
 }
 
-async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupDelay = 900) {
+async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupDelay = 900, router) {
   if (!Number.isInteger(info.dc) || info.dc < 1 || info.dc > 5 || typeof info.media !== 'boolean') {
     throw new LaneFault('obfuscation');
   }
   if (signal.aborted) throw new LaneFault('kws-connect');
 
   const hosts = kwsHosts(info);
+  const order = router?.plan(info) ?? [0, 1];
+  if (order[0] === 1) count('kws-cooldown-bypass');
   const attempts = [new AbortController(), new AbortController()];
   const started = Date.now();
 
@@ -874,6 +940,7 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
     let done = false, pending = 0, backupStarted = false, parallel = false;
     const timer = setTimeout(() => {
       if (done || backupStarted || parallelBackups >= MAX_PARALLEL_BACKUPS) return;
+      if (router && !router.canHedge(info, order[1])) return;
       parallel = true;
       parallelBackups++;
       count('kws-parallel-backup');
@@ -910,7 +977,9 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
 
     function start(index) {
       pending++;
-      void attemptKWS(hosts[index], attempts[index], fetcher, timeout).then(socket => {
+      const candidate = order[index];
+      const record = router?.start(info, candidate);
+      void attemptKWS(hosts[candidate], attempts[index], fetcher, timeout, record).then(socket => {
         pending--;
         if (done) {
           if (socket) releaseSocket(socket);
@@ -974,6 +1043,7 @@ class Lane {
     this.secret = secret;
     this.group = group;
     this.dial = dial;
+    this.directTCP = options.directTCP === true;
     this.budget = laneBudget(group);
     this.release = options.release ?? (() => { group.active--; });
     this.openMs = options.openMs ?? 12000;
@@ -1082,7 +1152,7 @@ class Lane {
     const clientRead = await obfuscationCipher(header, this.secret);
     const info = readHead(await clientRead(header));
     this.assertLive();
-    const head = makeHead(info);
+    const head = makeHead(info, this.directTCP);
     const dialing = Promise.resolve(this.dial(info, this.controller.signal));
     let peer, prepared;
     const prepare = Promise.all([
@@ -1110,15 +1180,60 @@ class Lane {
     this.peerWrite = peerWrite;
     this.packets = new PacketAssembly(info.mode, this.budget);
     this.head = null;
-    peer.binaryType = 'arraybuffer';
-    peer.addEventListener('message', this.onDown);
-    peer.addEventListener('close', this.onPeerClose);
-    peer.addEventListener('error', this.onPeerError);
-    peer.accept();
-    this.assertSocket(peer);
-    this.writeNative(peer, wire);
+    if (this.directTCP) {
+      await this.writeTCP(peer, wire);
+    } else {
+      peer.binaryType = 'arraybuffer';
+      peer.addEventListener('message', this.onDown);
+      peer.addEventListener('close', this.onPeerClose);
+      peer.addEventListener('error', this.onPeerError);
+      peer.accept();
+      this.assertSocket(peer);
+      this.writeNative(peer, wire);
+    }
     this.phase = 'streaming';
     clearTimeout(this.openTimer);
+    if (this.directTCP) void this.readTCP(peer);
+  }
+
+  async writeTCP(peer, bytes) {
+    this.assertLive();
+    const timer = setTimeout(() => this.stop('tcp-write-timeout'), this.stallMs);
+    try {
+      await peer.write(bytes);
+      this.assertLive();
+    } catch {
+      throw new LaneFault('tcp-write');
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async readTCP(peer) {
+    try {
+      while (!this.ended) {
+        if (!this.sending) await this.waitForCredit();
+        if (congested(this.socket, Math.min(DOWN_FRAME, this.sending) + 8)) {
+          await this.drain(this.socket, Math.min(DOWN_FRAME, this.sending) + 8);
+        }
+        // A BYOB read can neither exceed credit nor allocate an unbounded chunk.
+        const size = Math.min(this.sending, DOWN_FRAME);
+        this.budget.hold(size);
+        try {
+          const { done, value } = await peer.read(size);
+          this.assertLive();
+          if (done) {
+            this.stop('tcp-close');
+            return;
+          }
+          await this.enqueueDown(value);
+        } finally {
+          this.budget.release(size);
+        }
+      }
+    } catch (error) {
+      this.fault(error instanceof LaneFault ? error : new LaneFault('tcp-read'));
+    }
   }
 
   async feed(raw) {
@@ -1196,6 +1311,10 @@ class Lane {
       } else {
         wire = await this.peerWrite(bytes);
       }
+      if (this.directTCP) {
+        await this.writeTCP(peer, wire);
+        return;
+      }
       let start = 0;
       for (const end of ends) {
         this.assertSocket(peer);
@@ -1266,7 +1385,7 @@ class Lane {
         this.firstUpstream = true;
       }
       this.down.add({ data });
-      if (!this.downBusy) void this.pumpDown();
+      if (!this.downBusy) return this.pumpDown();
     } catch (error) {
       this.fault(error);
     }
@@ -1433,9 +1552,11 @@ class Lane {
     socket.removeEventListener('message', this.onMessage);
     socket.removeEventListener('close', this.onClose);
     socket.removeEventListener('error', this.onError);
-    peer?.removeEventListener('message', this.onDown);
-    peer?.removeEventListener('close', this.onPeerClose);
-    peer?.removeEventListener('error', this.onPeerError);
+    if (peer && !this.directTCP) {
+      peer.removeEventListener('message', this.onDown);
+      peer.removeEventListener('close', this.onPeerClose);
+      peer.removeEventListener('error', this.onPeerError);
+    }
     this.release();
     if (notify && socket.readyState === 1 && !congested(socket, 8)) {
       try { socket.send(encodeFrame(CLOSE, this.sid)); } catch {}
@@ -1867,7 +1988,9 @@ function bridgeResponse(host, boot, fast) {
 
 function portalResponse(host, secret, request, diagnostics, signedIn = false) {
   const nonce = b64(random(18));
+  const probe = diagnostics && signedIn;
   const csp = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action " + (signedIn ? "'self'; " : "'none'; ") +
+    (probe ? "connect-src 'self'; " : '') +
     "script-src 'nonce-" + nonce + "'; style-src 'nonce-" + nonce + "'";
   const link = 'tg://webproxy?server=' + encodeURIComponent(host) + '&amp;secret=' + encodeURIComponent(secret);
   const details = diagnostics ? portalDiagnostics(request) : '';
@@ -1915,6 +2038,7 @@ dl{display:grid;grid-template-columns:1fr auto;gap:5px}dd{margin:0}
 <p class="help" id="help">请使用支持 WEB 代理的 Telegram 版本。在应用内确认添加后启用代理。若设备没有打开 Telegram，可复制链接，在应用内打开。请将此页面和代理链接保存在私密位置。</p>
 ${signedIn && !diagnostics ? '<p class="help"><a href="' + adminPath + '?diagnostics=1">连接诊断</a></p>' : ''}
 ${details}
+${probe ? '<p class="help"><button type="button" id="probe">测量本机 HTTPS 往返</button></p><p id="probe-result" role="status"></p>' : ''}
 </main>
 <script nonce="${nonce}">
 document.getElementById('copy').addEventListener('click', async () => {
@@ -1929,6 +2053,34 @@ document.getElementById('copy').addEventListener('click', async () => {
     status.textContent = '链接已选中，请手动复制';
   }
 });
+${probe ? `document.getElementById('probe').addEventListener('click', async event => {
+  const button = event.currentTarget;
+  const result = document.getElementById('probe-result');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  const times = [];
+  button.disabled = true;
+  result.textContent = '正在测量…';
+  try {
+    for (let i = 0; i < 5; i++) {
+      const start = performance.now();
+      const response = await fetch('/admin?probe=1', {
+        method: 'HEAD', cache: 'no-store', credentials: 'same-origin',
+        mode: 'same-origin', redirect: 'error', signal: controller.signal,
+      });
+      if (response.status !== 204) throw Error();
+      times.push(performance.now() - start);
+    }
+    times.sort((a, b) => a - b);
+    result.textContent = '5 次 HTTPS 往返中位数 ' + Math.round(times[2]) +
+      ' ms，含浏览器请求与 Pages 鉴权。';
+  } catch {
+    result.textContent = '测量未完成，请检查网络和登录状态。';
+  } finally {
+    clearTimeout(timer);
+    button.disabled = false;
+  }
+});` : ''}
 </script>
 </body>
 </html>`;
@@ -2015,6 +2167,6 @@ function publicPage(method, title, content, form = false, status = 200) {
 }
 
 export {
-  advanceCounter, configuration, connectKWS, createCTR, encodeFrame, issueToken,
-  Lane, makeHead, packetSize, readHead, verifyBridge, verifyToken, visitFrames,
+  advanceCounter, configuration, connectKWS, createCTR, createWorker, encodeFrame, issueToken,
+  Lane, makeHead, packetSize, readHead, UpstreamRouter, verifyBridge, verifyToken, visitFrames,
 };
