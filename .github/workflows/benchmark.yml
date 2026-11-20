@@ -1,0 +1,29 @@
+name: Transport benchmark
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths: [telegram_webproxy.js, 'benchmarks/**']
+  pull_request:
+    paths: [telegram_webproxy.js, 'benchmarks/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
+        run: npm run bench
+      - if: github.event_name != 'workflow_dispatch' && github.ref_type != 'tag'
+        run: npm run bench -- --quick

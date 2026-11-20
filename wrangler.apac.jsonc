@@ -1,0 +1,33 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "telegram-webproxy",
+  "main": "telegram_webproxy.js",
+  "compatibility_date": "2026-11-18",
+  "keep_vars": true,
+  "workers_dev": false,
+  "durable_objects": {
+    "bindings": [{ "name": "PROXY_STATE", "class_name": "ProxySeedStore" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProxySeedStore"] }],
+  "placement": {
+    "region": "aws:ap-east-1"
+  },
+  "env": {
+    "tokyo": {
+      "durable_objects": {
+        "bindings": [{ "name": "PROXY_STATE", "class_name": "ProxySeedStore" }]
+      },
+      "placement": {
+        "region": "aws:ap-northeast-1"
+      }
+    },
+    "singapore": {
+      "durable_objects": {
+        "bindings": [{ "name": "PROXY_STATE", "class_name": "ProxySeedStore" }]
+      },
+      "placement": {
+        "region": "aws:ap-southeast-1"
+      }
+    }
+  }
+}
