@@ -73,10 +73,12 @@ async function connection(version, reconnect) {
     }
   };
   globalThis.fetch = async () => {
+    if (!attempts) mark('validHeadFirstKWSDial');
     if (++attempts === 1 && reconnect) return new UpgradeResponse(null, { status: 503 });
     peer = new FakeSocket();
     peer.onSend = wire => {
       if (wire.length !== 64) throw new Error('invalid upstream initialization');
+      mark('upstreamHeaderSent');
       const encrypted = independentCTR(wire, null, true).update(traffic);
       queueMicrotask(() => {
         mark('firstUpstreamBytes');

@@ -366,3 +366,54 @@ it('releases the upstream data charge before a congested downstream send', async
   }
   await until(() => group.bytes === 0);
 });
+
+it('releases consumed upload buffers before waiting to return credit', async () => {
+  const fixture = transportFixture();
+  const peer = new FakeSocket();
+  const { lane, group, client } = laneOf(1, fixture, async () => peer);
+  const payload = packet(Buffer.alloc(256 * 1024 - 4, 31));
+  try {
+    client.receive(encodeFrame(2, 1, fixture.wire));
+    await until(() => !lane.upBusy);
+    const creditBefore = lane.receiving;
+    client.bufferedAmount = 2 * 1024 * 1024;
+    const drain = vi.spyOn(lane, 'drain');
+    client.receive(encodeFrame(2, 1, fixture.toWorker.update(payload)));
+    await until(() => drain.mock.calls.length === 1);
+    expect(group.bytes).toBe(0);
+    expect(lane.receiving).toBe(creditBefore - payload.length);
+    expect(headers(peer, 0xdd, -2).forward.update(peer.sent[1])).toEqual(payload);
+    client.bufferedAmount = 0;
+    await until(() => !lane.upBusy);
+    expect(frames(client, 4).map(frame => frame.readUInt32BE())).toEqual([64, payload.length]);
+    expect(lane.receiving).toBe(creditBefore);
+  } finally {
+    client.close();
+  }
+  expect(group.bytes).toBe(0);
+});
+
+it('backs off native queue checks, releases drained bytes and cancels the next check on close', async () => {
+  vi.useFakeTimers();
+  const { lane, group, client } = laneOf(1, transportFixture(), async () => new FakeSocket());
+  const send = client.send.bind(client);
+  client.send = bytes => { send(bytes); client.bufferedAmount += bytes.length; };
+  try {
+    lane.writeNative(client, encodeFrame(4, 1, windowFrame(64)));
+    const reconcile = vi.spyOn(lane, 'reconcileNative');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(reconcile.mock.calls.filter(([socket]) => socket === client)).toHaveLength(6);
+    expect(group.bytes).toBe(12);
+    client.bufferedAmount = 0;
+    await vi.advanceTimersByTimeAsync(250);
+    expect(group.bytes).toBe(0);
+    expect(lane.nativeTimer).toBeNull();
+    lane.writeNative(client, encodeFrame(4, 1, windowFrame(64)));
+    client.close();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(group.bytes).toBe(0);
+  } finally {
+    client.close();
+    vi.useRealTimers();
+  }
+});

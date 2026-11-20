@@ -5,6 +5,7 @@ export const ORIGIN = 'https://' + HOST;
 export const VECTOR = 'cF3iQgotmFPcdnqmM642-vNpdfk-WLl8e50OXWBuxBQ';
 export const PROXY_SECRET = 'f7113e191685fefc9ae763a6d4e77c1f';
 export const ENV = {
+  p: 'synthetic-case-1',
   PORTAL_KEY: '29ea5f6692816233fd6716b5728035fe' + '30349835161228520064a5015a2a50af',
 };
 export const HELLO = Uint8Array.of(16, 0, 0, 0, 0, 0, 0, 1, 1);

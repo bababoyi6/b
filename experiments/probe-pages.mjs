@@ -6,8 +6,11 @@ import { independentCTR, packet } from '../tests/fixtures.js';
 
 const [passwordFile, ...options] = process.argv.slice(2);
 const includeMedia = options.includes('--media');
-const targets = options.filter(arg => arg !== '--media');
-if (!passwordFile || !targets.length) throw new Error('Usage: node experiments/probe-pages.mjs <test-password-file> <https-url> [...]');
+const paired = options.includes('--paired');
+const targets = options.filter(arg => arg !== '--media' && arg !== '--paired');
+if (!passwordFile || !targets.length || (paired && targets.length !== 2)) {
+  throw new Error('Usage: node experiments/probe-pages.mjs <test-password-file> [--media] [--paired] <https-url> [...]');
+}
 const password = readFileSync(passwordFile, 'utf8').trimEnd();
 assert.ok(password.length >= 16);
 
@@ -109,14 +112,17 @@ for (const target of targets) {
 
 const results = new Map(deployments.map(({ origin }) => [origin, []]));
 for (let round = 0; round < 3; round++) {
+  const order = round % 2 ? [...deployments].reverse() : deployments;
   for (let dc = 1; dc <= 5; dc++) {
     for (const media of includeMedia ? [false, true] : [false]) {
-      for (const deployment of round % 2 ? [...deployments].reverse() : deployments) {
+      const record = async deployment => {
         let sample;
         try { sample = { dc, media, ...await probe(deployment, dc, media) }; }
         catch (error) { sample = { dc, media, failure: error.message }; }
         results.get(deployment.origin).push(sample);
-      }
+      };
+      if (paired) await Promise.all(order.map(record));
+      else for (const deployment of order) await record(deployment);
     }
   }
 }

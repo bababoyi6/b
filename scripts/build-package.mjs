@@ -7,7 +7,7 @@ const workers = process.argv.includes('--workers');
 const filename = workers ? 'telegram_webproxy.js' : '_worker.js';
 const archive = workers ? 'Workers.zip' : 'Pages.zip';
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
-if (!/^const dashboardSeed = '';$/m.test(source) || !/^const passwordSetting = env => env\.p\b/m.test(source)) {
+if (!/^const dashboardSeed = '';$/m.test(source) || !/^  const value = env\.p;$/m.test(source)) {
   throw new Error('Build requires the public source with the p Secret');
 }
 if (/^\s*import\b/m.test(source) || !source.includes('export default')) {

@@ -1,10 +1,16 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { availableParallelism } from 'node:os';
-import { Lane, encodeFrame, visitFrames } from '../telegram_webproxy.js';
+import { pathToFileURL } from 'node:url';
+import { encodeFrame, visitFrames } from '../telegram_webproxy.js';
 import { createTCPEngine } from '../experiments/tcp.mjs';
 import { FakeSocket, independentCTR, packet, syntheticGroup, transportFixture, until, windowFrame } from '../tests/fixtures.js';
 
 const ORIGINAL = 'e565c57ff58656fd544755f67e1c266148c0b88f';
+const candidatePath = process.argv.find(arg => arg.startsWith('--candidate='))?.slice('--candidate='.length);
+const candidateURL = candidatePath ? pathToFileURL(candidatePath) : new URL('../telegram_webproxy.js', import.meta.url);
+const { Lane } = await import(candidateURL.href);
+const verifyPayload = process.argv.includes('--verify');
 const compare = process.argv.find(arg => arg.startsWith('--against='));
 let baseline = null;
 let BaselineLane, mkSession;
@@ -32,6 +38,8 @@ if (process.argv.includes('--sizes')) {
   for (const size of [1024, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024]) {
     workloads.push([size / 1024 + ' KiB 下载', [[64, size - 4, size >= 1024 * 1024 ? 2 : 8, 'down']]]);
   }
+  workloads.push(['1024 KiB 上传', [[32, 1024 * 1024 - 4, 2, 'up']]]);
+  workloads.push(['慢客户端持续下载', [[64, 128 * 1024 - 4, 8, 'down', true]]]);
 }
 
 class Socket extends FakeSocket {
@@ -87,18 +95,24 @@ function openFixture() {
   });
 }
 
-async function start(version, id, [count, size, burst, direction]) {
+async function start(version, id, [count, size, burst, direction, slow = false]) {
   const directTCP = version === 'tcp' || version === 'upstream-tcp';
   const fixture = transportFixture(0xdd, id);
   const client = new Socket();
+  const expected = verifyPayload ? createHash('sha256') : null;
+  const receivedUp = verifyPayload && direction !== 'down' ? createHash('sha256') : null;
+  const receivedDown = verifyPayload && direction !== 'up' ? createHash('sha256') : null;
   let peer, current;
-  let credit = 0, downstream = 0, wake;
+  let credit = 0, downstream = 0, queuedPayload = 0, wake;
   client.onSend = data => {
+    if (slow && data[0] === 2) client.bufferedAmount += data.byteLength;
     visitFrames(data, (type, sid, bytes, start, end) => {
       if (type === 4) credit += new DataView(bytes.buffer, bytes.byteOffset).getUint32(start);
       if (type === 2) {
         downstream += end - start;
-        client.receive(encodeFrame(4, id, windowFrame(end - start)));
+        if (receivedDown) receivedDown.update(fixture.fromWorker.update(bytes.subarray(start, end)));
+        if (slow) queuedPayload += end - start;
+        else client.receive(encodeFrame(4, id, windowFrame(end - start)));
       }
     });
     wake?.();
@@ -120,21 +134,41 @@ async function start(version, id, [count, size, burst, direction]) {
   peer = await ready;
   await until(() => peer.sends === 1 && credit === 64);
   const reverse = independentCTR(peer.head, null, true);
+  if (receivedUp) {
+    const forward = independentCTR(peer.head);
+    forward.update(peer.head); // The 64-byte obfuscation header consumes the first four blocks.
+    peer.onSend = bytes => receivedUp.update(forward.update(bytes));
+  }
   const payload = packet(Buffer.alloc(size, 47));
   const batches = [];
   for (let i = 0; i < count; i += burst) {
     const batch = [];
     for (let pos = i; pos < Math.min(count, i + burst); pos++) {
+      let sample = payload;
+      if (expected) {
+        sample = Buffer.from(payload);
+        sample.writeUInt16LE(pos, sample.length - 2);
+        expected.update(sample);
+      }
       batch.push([
-        direction !== 'down' ? encodeFrame(2, id, fixture.toWorker.update(payload)) : null,
-        direction !== 'up' ? reverse.update(payload) : null,
+        direction !== 'down' ? encodeFrame(2, id, fixture.toWorker.update(sample)) : null,
+        direction !== 'up' ? reverse.update(sample) : null,
       ]);
     }
     batches.push(batch);
   }
+  const consume = slow ? setInterval(() => {
+    const wireBytes = Math.min(client.bufferedAmount, 128 * 1024);
+    client.bufferedAmount -= wireBytes;
+    const payloadBytes = Math.min(queuedPayload, wireBytes);
+    if (!payloadBytes) return;
+    queuedPayload -= payloadBytes;
+    client.receive(encodeFrame(4, id, windowFrame(payloadBytes)));
+  }, 4) : null;
   return {
-    client, peer,
+    client, peer, budgetBytes: () => current?.group.bytes ?? 0,
     async close() {
+      clearInterval(consume);
       client.close();
       if (current) await until(() => !current.upBusy && !current.downBusy);
     },
@@ -156,14 +190,21 @@ async function start(version, id, [count, size, burst, direction]) {
             if (up) client.receive(up);
             if (down) peer.receive(down);
           }
+          if (slow) probe();
         });
         latencies.push(performance.now() - time);
         probe();
       }
+      if (slow) await until(() => client.bufferedAmount === 0);
       if (credit !== upBytes + 64 || downstream !== downBytes) throw new Error('byte count mismatch');
       if (peer.sentBytes !== upBytes + 64) throw new Error('upstream byte count mismatch');
       if (!directTCP && peer.sends !== (direction === 'down' ? 1 : count + 1)) {
         throw new Error('KWS frame boundary mismatch');
+      }
+      if (expected) {
+        const checksum = expected.digest('hex');
+        if ((receivedUp && receivedUp.digest('hex') !== checksum) ||
+            (receivedDown && receivedDown.digest('hex') !== checksum)) throw new Error('plaintext integrity mismatch');
       }
       return upBytes + downBytes;
     },
@@ -181,8 +222,11 @@ async function measure(version, spec) {
     for (const [n, lane] of spec.entries()) lanes.push(await start(version, n + 1, lane));
     globalThis.gc?.();
     const before = takeMemory();
-    let peak = before;
-    const probe = () => { peak = Math.max(peak, takeMemory()); };
+    let peak = before, peakBudget = 0;
+    const probe = () => {
+      peak = Math.max(peak, takeMemory());
+      peakBudget = Math.max(peakBudget, lanes.reduce((sum, lane) => sum + lane.budgetBytes(), 0));
+    };
     timer = setInterval(probe, 2);
     crypto.subtle.encrypt = async function (algorithm, key, input) {
       const result = await originalEncrypt.call(this, algorithm, key, input);
@@ -201,7 +245,8 @@ async function measure(version, spec) {
     return {
       MiBps: bytes / (1024 * 1024) / (elapsed / 1000),
       cpuMs: (cpu.user + cpu.system) / 1000, p50Ms: percentile(.50), p95Ms: percentile(.95),
-      peakBuffersMiB: (peak - before) / (1024 * 1024), cryptoCalls: cryptoStats.calls,
+      peakBuffersMiB: (peak - before) / (1024 * 1024), peakBudgetMiB: peakBudget / (1024 * 1024),
+      cryptoCalls: cryptoStats.calls,
       cryptoOutputMiB: cryptoStats.output / (1024 * 1024),
       [version.endsWith('tcp') ? 'tcpWrites' : 'kwsSends']: lanes.reduce((n, lane) => n + lane.peer.sends - 1, 0),
       workerSends: lanes.reduce((n, lane) => n + lane.client.sends - 1, 0),
@@ -219,7 +264,7 @@ if (process.argv.includes('--tcp')) {
   if (BaselineLane && process.argv.includes('--tcp-baseline')) variants.push('upstream-tcp');
   variants.push('tcp');
 }
-console.log(JSON.stringify({ node: process.version, platform: process.platform, cpus: availableParallelism(), rounds, baseline }));
+console.log(JSON.stringify({ node: process.version, platform: process.platform, cpus: availableParallelism(), rounds, baseline, candidatePath, verifyPayload }));
 for (const [name, spec] of workloads) {
   const results = Object.fromEntries(variants.map(variant => [variant, []]));
   for (const variant of variants) await measure(variant, spec);

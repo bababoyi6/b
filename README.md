@@ -15,6 +15,8 @@
 
 只用 `p` 的同域名部署保留相同密码即可继续使用已生成的链接。更新时在编辑器替换完整 JS。需要回退时，在 Worker 的 **部署** 里选择上一正常版本并回滚。 [Workers 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
 
-[Workers 验收、性能与免费额度](./docs/workers.md) · [历史 Pages 版本](https://github.com/bababoyi6/b/releases/tag/v0.1.0-pages.1) · [Pages 实验记录](./docs/pages.md)
+从 v0.3.0 起，所有新代理连接和管理操作都要求有效的 `p`。使用历史种子的部署可以保留原种子以维持原链接，并改用 `/admin` 登录。
+
+[本版性能、认证与 cfnew 对照](./docs/cfnew-study.md) · [Workers 免费额度与先前验收](./docs/workers.md) · [历史 Pages 版本](https://github.com/bababoyi6/b/releases/tag/v0.1.0-pages.1) · [Pages 实验记录](./docs/pages.md)
 
 按 [GPL-3.0](./LICENSE) 分发。

@@ -4,6 +4,7 @@ import worker, { encodeFrame } from '../telegram_webproxy.js';
 
 const base = 'https://proxy.example.com';
 const env = {
+  p: 'synthetic-case-1',
   PORTAL_KEY: '29ea5f6692816233fd6716b5728035fe30349835161228520064a5015a2a50af',
 };
 const HELLO = Uint8Array.of(16, 0, 0, 0, 0, 0, 0, 1, 1);
@@ -122,12 +123,24 @@ function open(token, sid, origin = base) {
   } }), env);
 }
 
+async function adminCookie() {
+  const login = await worker.fetch(new Request(base + '/admin', {
+    method: 'POST', headers: { Origin: base, 'CF-Connecting-IP': '192.0.2.33' },
+    body: new URLSearchParams({ password: env.p }),
+  }), env);
+  expect(login.status).toBe(303);
+  return login.headers.get('Set-Cookie').split(';', 1)[0];
+}
+
 it('loads the single module under workerd and authenticates portal, Bridge and the lane upgrade', async () => {
   const home = await worker.fetch(new Request(base), {});
   expect(home.status).toBe(200);
   expect(await home.text()).toContain('Welcome to nginx!');
   expect((await worker.fetch(new Request(base + '/' + env.PORTAL_KEY), {})).status).toBe(404);
-  expect((await worker.fetch(new Request(base + '/' + env.PORTAL_KEY), env)).status).toBe(200);
+  expect((await worker.fetch(new Request(base + '/' + env.PORTAL_KEY), env)).status).toBe(404);
+  expect((await worker.fetch(new Request(base + '/?bridge=' + VECTOR), { PORTAL_KEY: env.PORTAL_KEY })).status).toBe(404);
+  const admin = await worker.fetch(new Request(base + '/admin', { headers: { Cookie: await adminCookie() } }), env);
+  expect(await admin.text()).toContain(PROXY_SECRET);
   const ticket = await create(true);
   expect((await open(ticket, 9, 'https://other.example.com')).status).toBe(404);
   expect((await open(ticket, '09')).status).toBe(404);
@@ -182,7 +195,9 @@ it('streams through real workerd sockets to a mock binary KWS upgrade and closes
     expect(event.data.byteLength).toBe(64);
     expect(wsFetch).toHaveBeenCalledTimes(1);
     expect(wsFetch.mock.calls[0][0]).toBe('https://kws3-1.web.telegram.org/apiws');
-    const diagnostics = await worker.fetch(new Request(base + '/' + env.PORTAL_KEY + '?diagnostics=1'), env);
+    const diagnostics = await worker.fetch(new Request(base + '/admin?diagnostics=1', {
+      headers: { Cookie: await adminCookie() },
+    }), env);
     const details = await diagnostics.text();
     expect(details).toMatch(/Worker 处理 WebSocket 升级<\/dt><dd>\d+ 次，P95/);
     expect(details).toMatch(/Worker 到 KWS 建连<\/dt><dd>\d+ 次，P95/);

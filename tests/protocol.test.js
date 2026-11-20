@@ -68,8 +68,8 @@ it('allows password setup and keeps portal sessions separate from stable proxy c
   expect(logout.headers.get('Set-Cookie')).toContain('Max-Age=0');
   expect(logout.headers.get('Location')).toBe('/');
 
-  const legacy = { ...ENV, PORTAL_PASSWORD: password };
-  expect((await login(legacy)).status).toBe(303);
+  const legacy = { PORTAL_KEY: ENV.PORTAL_KEY, PORTAL_PASSWORD: password };
+  expect((await login(legacy)).status).toBe(404);
   expect((await login({ ...legacy, p: rotated.p })).status).toBe(401);
 
   const ip = '192.0.2.6';
@@ -127,6 +127,7 @@ it('signs in with only a password when the Worker source has been prepared for t
   expect(body).not.toContain(ENV.PORTAL_KEY);
   expect((await dashboardConfiguration({ p: 'rotated-dashboard-password' }, HOST)).secret).toBe(PROXY_SECRET);
   expect((await dashboard.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), env)).status).toBe(200);
+  expect((await dashboard.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), {})).status).toBe(404);
 });
 
 it('lets the first login retry after a temporary storage error', async () => {
@@ -290,18 +291,24 @@ describe('carrier authentication', () => {
   });
 
   it('protects the portal and separates it from Bridge authentication', async () => {
-    const response = await worker.fetch(new Request(ORIGIN + '/' + ENV.PORTAL_KEY), ENV);
+    const login = await worker.fetch(new Request(ORIGIN + '/admin', {
+      method: 'POST', headers: { Origin: ORIGIN, 'CF-Connecting-IP': '192.0.2.71' },
+      body: new URLSearchParams({ password: ENV.p }),
+    }), ENV);
+    expect(login.status).toBe(303);
+    const cookie = login.headers.get('Set-Cookie').split(';', 1)[0];
+    const response = await worker.fetch(new Request(ORIGIN + '/admin', { headers: { Cookie: cookie } }), ENV);
     const html = await response.text();
     expect(response.status).toBe(200);
     expect(response.headers.get('cache-control')).toBe('no-store');
-    expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(response.headers.get('referrer-policy')).toBe('same-origin');
     expect(response.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
     expect(html).toContain('tg://webproxy?server=proxy.example.com&amp;secret=' + PROXY_SECRET);
     expect(html).not.toContain('382abaf798ad5db247fdccdb3fd6521d8c99ced045d85ff689a997a6a4baec88');
     expect(html).not.toContain(ENV.PORTAL_KEY);
     expect(html).not.toContain('当前实例诊断');
-    const diagnostic = new Request(ORIGIN + '/' + ENV.PORTAL_KEY + '?diagnostics=1', {
-      headers: { 'cf-placement': 'remote-NRT' },
+    const diagnostic = new Request(ORIGIN + '/admin?diagnostics=1', {
+      headers: { Cookie: cookie, 'cf-placement': 'remote-NRT' },
     });
     Object.defineProperty(diagnostic, 'cf', { value: { colo: 'HKG', clientTcpRtt: 42 } });
     const debug = await worker.fetch(diagnostic, ENV);
@@ -312,7 +319,7 @@ describe('carrier authentication', () => {
     expect(details).toContain('客户端到 Cloudflare RTT</dt><dd>42 ms');
     expect(details).toContain('代理升级请求的入口 RTT');
     expect(details).toContain('Worker 到 KWS 建连');
-    const head = await worker.fetch(new Request(ORIGIN + '/' + ENV.PORTAL_KEY, { method: 'HEAD' }), ENV);
+    const head = await worker.fetch(new Request(ORIGIN + '/admin', { method: 'HEAD', headers: { Cookie: cookie } }), ENV);
     expect(await head.text()).toBe('');
     const bridge = await worker.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), ENV);
     expect(await bridge.text()).not.toContain(PROXY_SECRET);
@@ -367,7 +374,7 @@ describe('carrier authentication', () => {
     }
   });
 
-  it('derives stable, host-specific keys from only PORTAL_KEY and rejects invalid access codes', async () => {
+  it('keeps saved seeds compatible with valid p and rejects invalid seeds', async () => {
     for (const bad of [{}, { PORTAL_KEY: '' }, { PORTAL_KEY: 'short' },
       { PORTAL_KEY: ENV.PORTAL_KEY + ' ' }, { PORTAL_KEY: 'z'.repeat(64) }]) {
       expect(await configuration(bad, HOST)).toBeNull();
@@ -377,9 +384,40 @@ describe('carrier authentication', () => {
     expect(cfg.secret).toBe(PROXY_SECRET);
     expect((await configuration(ENV, 'other.example.com')).secret).not.toBe(PROXY_SECRET);
     expect((await configuration({ PORTAL_KEY: ENV.PORTAL_KEY.toUpperCase() }, HOST)).secret).toBe(PROXY_SECRET);
-    const rotated = { PORTAL_KEY: 'a3' + ENV.PORTAL_KEY.slice(2) };
+    const rotated = { ...ENV, PORTAL_KEY: 'a3' + ENV.PORTAL_KEY.slice(2) };
     expect((await configuration(rotated, HOST)).secret).not.toBe(PROXY_SECRET);
     expect((await worker.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), rotated)).status).toBe(404);
+  });
+
+  it('rejects real capabilities and tickets when p is missing or invalid', async () => {
+    const boot = await bridgeBoot(worker);
+    const session = await worker.fetch(authRequest('/api/v1/session', boot, HELLO), ENV);
+    expect(session.status).toBe(200);
+    const ticket = session.headers.get('X-Session-Token');
+    const renewal = session.headers.get('X-Session-Renewal');
+    const derive = vi.spyOn(crypto.subtle, 'deriveBits');
+    for (const env of [
+      { PORTAL_KEY: ENV.PORTAL_KEY },
+      { PORTAL_KEY: ENV.PORTAL_KEY, PORTAL_PASSWORD: ENV.p },
+      { PROXY_SEED: ENV.PORTAL_KEY, p: ENV.p.slice(0, 15) },
+      { PROXY_SEED: ENV.PORTAL_KEY, p: '界'.repeat(86) },
+    ]) {
+      for (const request of [
+        new Request(ORIGIN + '/admin'),
+        new Request(ORIGIN + '/?bridge=' + VECTOR),
+        authRequest('/api/v1/session', boot, HELLO),
+        authRequest('/api/v1/session', ticket, null, 'DELETE'),
+        authRequest('/api/v1/session/renew', renewal),
+        new Request(ORIGIN + '/api/v1/ws', { headers: {
+          Upgrade: 'websocket', 'Sec-WebSocket-Protocol': 'tproxy-lane-v1.' + ticket + '.1',
+        } }),
+      ]) {
+        const response = await worker.fetch(request, env);
+        expect(response.status).toBe(404);
+        expect(await response.text()).toBe('');
+      }
+    }
+    expect(derive).not.toHaveBeenCalled();
   });
 
   it('rejects raw keys, wrong purpose, expired, forged and cross-host credentials', async () => {

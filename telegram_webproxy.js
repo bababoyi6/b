@@ -109,7 +109,7 @@ export class ProxySeedStore {
   }
 }
 
-async function configuration(env, host, initialize = false) {
+async function configuration(env, host, initialize = false, password = portalPassword(env)) {
   let seed = env.PROXY_SEED ?? env.PORTAL_KEY;
   const store = env.PROXY_STATE;
   if (seed === undefined && store) {
@@ -130,7 +130,7 @@ async function configuration(env, host, initialize = false) {
   seed ??= dashboardSeed || undefined;
   const fromPassword = seed === undefined;
   if (!fromPassword && (typeof seed !== 'string' || !accessCodePattern.test(seed))) return null;
-  const source = fromPassword ? passwordSetting(env) : seed.toLowerCase();
+  const source = fromPassword ? env.p : seed.toLowerCase();
   const cached = configurations.get(host);
   if (cached?.source === source && cached?.fromPassword === fromPassword) {
     configurations.delete(host);
@@ -139,9 +139,8 @@ async function configuration(env, host, initialize = false) {
   }
   // Only pure WebCrypto work is shared. The legacy binding fetch above
   // stays in the invocation that owns the I/O.
-  const password = fromPassword ? portalPassword(env) : null;
   if (fromPassword && !password) return null;
-  const result = deriveConfiguration(host, password, source);
+  const result = deriveConfiguration(host, fromPassword ? password : null, source);
   const entry = { source, fromPassword, result };
   configurations.delete(host);
   configurations.set(host, entry);
@@ -412,10 +411,8 @@ const logoutPath = adminPath + '/logout';
 const loginAttempts = new Map();
 let loginWindow = -1, loginTotal = 0;
 
-const passwordSetting = env => env.p ?? env.PORTAL_PASSWORD;
-
 function portalPassword(env) {
-  const value = passwordSetting(env);
+  const value = env.p;
   if (typeof value !== 'string' || value.length < 16 || value.length > 256) return null;
   const bytes = textEncoder.encode(value);
   return bytes.length <= 256 ? bytes : null;
@@ -449,9 +446,7 @@ async function portalSessionMAC(cfg, host, password, body) {
   return carrierMAC(cfg, host, PORTAL_SESSION, append(await passwordDigest(password), body));
 }
 
-async function routePortal(request, env, url, host) {
-  const password = portalPassword(env);
-  if (!password) return unavailable();
+async function routePortal(request, env, url, host, password) {
   const { pathname, search } = url;
   const { method, headers } = request;
   const read = method === 'GET' || method === 'HEAD';
@@ -470,7 +465,7 @@ async function routePortal(request, env, url, host) {
         !equalBytes(await passwordDigest(value), await passwordDigest(password))) {
       return loginResponse(method, '密码有误，请重试。', 401);
     }
-    const cfg = await configuration(env, host, true).catch(() => {
+    const cfg = await configuration(env, host, true, password).catch(() => {
       count('configuration-error');
       return null;
     });
@@ -486,12 +481,12 @@ async function routePortal(request, env, url, host) {
     .filter(value => value.startsWith(portalCookie + '='));
   const token = cookies.length === 1 && decodeToken(cookies[0].slice(portalCookie.length + 1));
   if (!token || view(token).getUint32(0) <= now()) return probe ? unavailable() : loginResponse(method);
-  const cfg = await configuration(env, host);
+  const cfg = await configuration(env, host, false, password);
   if (!cfg || !equalBytes(token.subarray(16), await portalSessionMAC(cfg, host, password, token.subarray(0, 16)))) {
     return probe ? unavailable() : loginResponse(method);
   }
   if (probe) return new Response(null, { status: 204, headers: noStore });
-  return portalResponse(host, cfg.secret, request, Boolean(search), true);
+  return portalResponse(host, cfg.secret, request, Boolean(search));
 }
 
 async function route(request, env, dial, directTCP) {
@@ -504,14 +499,11 @@ async function route(request, env, dial, directTCP) {
     return publicHomeResponse(method);
   }
   if (path === adminPath || path === logoutPath) {
-    return routePortal(request, env, url, host);
+    const password = portalPassword(env);
+    return password ? routePortal(request, env, url, host, password) : unavailable();
   }
   const sameOrigin = !headers.has('Origin') || headers.get('Origin') === url.origin;
   const capability = method === 'GET' && path === '/' && /^\?bridge=([A-Za-z0-9_-]{43})$/.exec(url.search)?.[1];
-  const diagnostics = url.search === '?diagnostics=1';
-  const portal = passwordSetting(env) === undefined && env.PROXY_SEED === undefined &&
-    (method === 'GET' || method === 'HEAD') &&
-    (!url.search || diagnostics) && /^\/[0-9a-f]{64}$/i.test(path);
   const api = !url.search && sameOrigin;
   const session = api && path === '/api/v1/session' && (method === 'POST' || method === 'DELETE');
   const renewal = api && path === '/api/v1/session/renew' && method === 'POST';
@@ -525,18 +517,14 @@ async function route(request, env, dial, directTCP) {
   const token = (session || renewal) && !headers.has('Cookie') ? bearer(request) : null;
   const purpose = upgrade || method === 'DELETE' ? SESSION : renewal ? RENEWAL : BOOTSTRAP;
   const claims = decodeLiveToken(purpose, upgrade ? upgrade.token : token);
-  if (!(portal || (capability && canonicalTokenPattern.test(capability)) || claims)) return unavailable();
-  if (portal) {
-    const accessCode = env.PORTAL_KEY;
-    if (typeof accessCode !== 'string' || !accessCodePattern.test(accessCode) ||
-        !equalBytes(hex(path.slice(1)), hex(accessCode))) return unavailable();
-  }
+  if (!((capability && canonicalTokenPattern.test(capability)) || claims)) return unavailable();
+  const password = portalPassword(env);
+  if (!password) return unavailable();
 
   const started = upgrade || capability ? Date.now() : 0;
-  const cfg = await configuration(env, host);
+  const cfg = await configuration(env, host, false, password);
   if (!cfg) return unavailable();
 
-  if (portal) return portalResponse(host, cfg.secret, request, diagnostics);
   if (capability) {
     const configured = Date.now();
     if (!(await verifyBridge(cfg.bridgeKey, host, capability))) return unavailable();
@@ -789,7 +777,15 @@ class Queue {
   bytes = 0;
 
   get length() { return this.items.length - this.head; }
-  peek() { return this.items[this.head]; }
+  prefixBytes(limit) {
+    let bytes = 0;
+    for (let index = this.head; index < this.items.length; index++) {
+      const size = this.items[index].data.length;
+      if (bytes + size > limit) break;
+      bytes += size;
+    }
+    return bytes;
+  }
 
   add(item) {
     this.items.push(item);
@@ -940,7 +936,7 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
   const hosts = kwsHosts(info);
   const order = router?.plan(info) ?? [0, 1];
   if (order[0] === 1) count('kws-cooldown-bypass');
-  const attempts = [new AbortController(), new AbortController()];
+  const attempts = [];
   const started = Date.now();
 
   return new Promise((resolve, reject) => {
@@ -984,9 +980,11 @@ async function connectKWS(info, signal, fetcher = fetch, timeout = 3000, backupD
 
     function start(index) {
       pending++;
+      const attempt = new AbortController();
+      attempts[index] = attempt;
       const candidate = order[index];
       const record = router?.start(info, candidate);
-      void attemptKWS(hosts[candidate], attempts[index], fetcher, timeout, record).then(socket => {
+      void attemptKWS(hosts[candidate], attempt, fetcher, timeout, record).then(socket => {
         pending--;
         if (done) {
           if (socket) releaseSocket(socket);
@@ -1344,35 +1342,43 @@ class Lane {
     this.upBusy = true;
     try {
       while (!this.ended && this.up.length) {
-        const batch = [this.up.take()];
-        let length = batch[0].data.length, copy = 0;
-        const limit = packLimit(length);
+        let item = this.up.take();
+        let raw = item.data, copy = 0;
+        const length = raw.length + this.up.prefixBytes(packLimit(raw.length) - raw.length);
         try {
-          while (this.up.length && length + this.up.peek().data.length <= limit) {
-            const item = this.up.take();
-            length += item.data.length;
-            batch.push(item);
-          }
-          let raw = batch[0].data;
-          if (batch.length > 1) {
+          if (length !== raw.length) {
             this.budget.hold(length);
             copy = length;
-            raw = new Uint8Array(length);
-            let offset = 0;
-            for (const item of batch) {
-              raw.set(item.data, offset);
-              offset += item.data.length;
+            const packed = new Uint8Array(length);
+            packed.set(raw);
+            let offset = raw.length;
+            this.releaseUp(item);
+            item = null;
+            while (offset < length) {
+              const next = this.up.take();
+              packed.set(next.data, offset);
+              offset += next.data.length;
+              this.releaseUp(next);
             }
+            raw = packed;
           }
           await this.feed(raw);
+          // The CREDIT notification can block even after the upstream send.
+          raw = null;
+          if (item) {
+            this.releaseUp(item);
+            item = null;
+          }
+          if (copy) {
+            this.budget.release(copy);
+            copy = 0;
+          }
           this.assertLive();
           if (congested(this.socket, 12)) await this.drain(this.socket, 12);
-          const delta = new Uint8Array(4);
-          view(delta).setUint32(0, length);
-          this.send(CREDIT, delta);
+          this.sendCredit(length);
           this.receiving += length;
         } finally {
-          for (const item of batch) this.releaseUp(item);
+          if (item) this.releaseUp(item);
           if (copy) this.budget.release(copy);
         }
       }
@@ -1430,27 +1436,25 @@ class Lane {
     this.downBusy = true;
     try {
       while (!this.ended && this.down.length) {
-        const batch = [this.down.take()];
-        let length = batch[0].data.length, copy = 0;
-        const limit = packLimit(length);
+        let item = this.down.take();
+        let bytes = item.data, copy = 0;
+        const length = bytes.length + this.down.prefixBytes(packLimit(bytes.length) - bytes.length);
         try {
-          while (this.down.length && length + this.down.peek().data.length <= limit) {
-            const item = this.down.take();
-            length += item.data.length;
-            batch.push(item);
-          }
-          let bytes = batch[0].data;
-          if (batch.length > 1) {
+          if (length !== bytes.length) {
             this.budget.hold(length);
             copy = length;
-            bytes = new Uint8Array(length);
-            let offset = 0;
-            for (const item of batch) {
-              bytes.set(item.data, offset);
-              offset += item.data.length;
+            const packed = new Uint8Array(length);
+            packed.set(bytes);
+            let offset = bytes.length;
+            this.releaseDown(item);
+            item = null;
+            while (offset < length) {
+              const next = this.down.take();
+              packed.set(next.data, offset);
+              offset += next.data.length;
+              this.releaseDown(next);
             }
-            for (const item of batch) this.releaseDown(item);
-            batch.length = 0;
+            bytes = packed;
           }
           for (let offset = 0; offset < length;) {
             if (!this.sending) await this.waitForCredit();
@@ -1467,7 +1471,8 @@ class Lane {
                   this.budget.release(copy);
                   copy = 0;
                 } else {
-                  this.releaseDown(batch.pop());
+                  this.releaseDown(item);
+                  item = null;
                 }
               }
               this.assertLive();
@@ -1504,7 +1509,7 @@ class Lane {
             offset += size;
           }
         } finally {
-          for (const item of batch) this.releaseDown(item);
+          if (item) this.releaseDown(item);
           if (copy) this.budget.release(copy);
         }
       }
@@ -1515,9 +1520,14 @@ class Lane {
     }
   }
 
-  send(type, payload) {
+  sendCredit(length) {
     this.assertSocket(this.socket);
-    this.writeNative(this.socket, encodeFrame(type, this.sid, payload));
+    const bytes = new Uint8Array(12);
+    const header = view(bytes);
+    header.setUint32(0, CREDIT * 0x1000000 + this.sid);
+    header.setUint32(4, 4);
+    header.setUint32(8, length);
+    this.writeNative(this.socket, bytes);
   }
 
   reconcileNative(socket, side) {
@@ -1530,15 +1540,18 @@ class Lane {
     }
   }
 
-  scheduleNativeCheck() {
-    if (this.nativeTimer !== null || !this.nativeBytes.some(Boolean)) return;
+  scheduleNativeCheck(delay = 30) {
+    if (this.nativeTimer !== null || !(this.nativeBytes[0] || this.nativeBytes[1])) return;
     this.nativeTimer = setTimeout(() => {
       this.nativeTimer = null;
       if (this.ended) return;
+      const before = this.nativeBytes[0] + this.nativeBytes[1];
       this.reconcileNative(this.socket, 0);
       this.reconcileNative(this.peer, 1);
-      this.scheduleNativeCheck();
-    }, 30);
+      // Bound the polling cost while the native queue makes no progress.
+      const drained = this.nativeBytes[0] + this.nativeBytes[1] < before;
+      this.scheduleNativeCheck(drained ? 30 : Math.min(delay * 2, 250));
+    }, delay);
   }
 
   writeNative(socket, payload) {
@@ -2016,11 +2029,10 @@ function bridgeResponse(host, boot, fast) {
   ].join('; '), permissions + ', clipboard-read=(), clipboard-write=()');
 }
 
-function portalResponse(host, secret, request, diagnostics, signedIn = false) {
+function portalResponse(host, secret, request, diagnostics) {
   const nonce = b64(random(18));
-  const probe = diagnostics && signedIn;
-  const csp = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action " + (signedIn ? "'self'; " : "'none'; ") +
-    (probe ? "connect-src 'self'; " : '') +
+  const csp = "default-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; " +
+    (diagnostics ? "connect-src 'self'; " : '') +
     "script-src 'nonce-" + nonce + "'; style-src 'nonce-" + nonce + "'";
   const link = 'tg://webproxy?server=' + encodeURIComponent(host) + '&amp;secret=' + encodeURIComponent(secret);
   const details = diagnostics ? portalDiagnostics(request) : '';
@@ -2062,13 +2074,13 @@ dl{display:grid;grid-template-columns:1fr auto;gap:5px}dd{margin:0}
 <div class="actions">
   <a href="${link}" rel="noreferrer">打开 Telegram</a>
   <button type="button" id="copy">复制链接</button>
-  ${signedIn ? '<form action="' + logoutPath + '" method="post"><button type="submit">退出登录</button></form>' : ''}
+  <form action="${logoutPath}" method="post"><button type="submit">退出登录</button></form>
 </div>
 <p id="feedback" role="status"></p>
 <p class="help" id="help">请使用支持 WEB 代理的 Telegram 版本。在应用内确认添加后启用代理。若设备没有打开 Telegram，可复制链接，在应用内打开。请将此页面和代理链接保存在私密位置。</p>
-${signedIn && !diagnostics ? '<p class="help"><a href="' + adminPath + '?diagnostics=1">连接诊断</a></p>' : ''}
+${diagnostics ? '' : '<p class="help"><a href="' + adminPath + '?diagnostics=1">连接诊断</a></p>'}
 ${details}
-${probe ? '<p class="help"><button type="button" id="probe">测量本机 HTTPS 往返</button></p><p id="probe-result" role="status"></p>' : ''}
+${diagnostics ? '<p class="help"><button type="button" id="probe">测量本机 HTTPS 往返</button></p><p id="probe-result" role="status"></p>' : ''}
 </main>
 <script nonce="${nonce}">
 document.getElementById('copy').addEventListener('click', async () => {
@@ -2083,7 +2095,7 @@ document.getElementById('copy').addEventListener('click', async () => {
     status.textContent = '链接已选中，请手动复制';
   }
 });
-${probe ? `document.getElementById('probe').addEventListener('click', async event => {
+${diagnostics ? `document.getElementById('probe').addEventListener('click', async event => {
   const button = event.currentTarget;
   const result = document.getElementById('probe-result');
   const controller = new AbortController();
@@ -2103,7 +2115,7 @@ ${probe ? `document.getElementById('probe').addEventListener('click', async even
     }
     times.sort((a, b) => a - b);
     result.textContent = '5 次 HTTPS 往返中位数 ' + Math.round(times[2]) +
-      ' ms，含浏览器请求与 Pages 鉴权。';
+      ' ms，含浏览器请求与 Worker 鉴权。';
   } catch {
     result.textContent = '测量未完成，请检查网络和登录状态。';
   } finally {
@@ -2115,7 +2127,7 @@ ${probe ? `document.getElementById('probe').addEventListener('click', async even
 </body>
 </html>`;
   return htmlResponse(request.method === 'HEAD' ? null : body, csp,
-    permissions + ', clipboard-read=(), clipboard-write=(self)', { form: signedIn });
+    permissions + ', clipboard-read=(), clipboard-write=(self)', { form: true });
 }
 
 function portalDiagnostics(request) {
