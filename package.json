@@ -6,7 +6,8 @@
   "scripts": {
     "test": "vitest run --config vitest.config.js",
     "test:runtime": "vitest run --config vitest.workers.config.js",
-    "bench": "node --expose-gc benchmarks/transport.mjs"
+    "bench": "node --expose-gc benchmarks/transport.mjs",
+    "bench:startup": "node benchmarks/startup.mjs"
   },
   "engines": {
     "node": ">=24"

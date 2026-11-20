@@ -4,7 +4,7 @@ const KiB = 1024;
 const MiB = 1024 * KiB;
 const WINDOW = 4 * MiB;
 const DOWN_FRAME = 64 * KiB;
-const DOWN_CRYPT = 512 * KiB;
+const CRYPT_CHUNK = 512 * KiB;
 const SOCKET_BUFFER = 2 * MiB;
 const MAX_MESSAGE = 2 * MiB;
 const MAX_FRAME = MiB;
@@ -40,12 +40,13 @@ const hex = value => Uint8Array.from(value.match(/../g), pair => Number.parseInt
 const b64 = bytes => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
 const binary = value => value instanceof ArrayBuffer ? new Uint8Array(value) : value;
 const tokenPattern = /^[A-Za-z0-9_-]{43}$/;
+// A canonical 32-byte base64url token has two zero padding bits.
+const canonicalTokenPattern = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
 const accessCodePattern = /^[0-9a-f]{64}$/i;
 
 function decodeToken(value) {
-  if (typeof value !== 'string' || !tokenPattern.test(value)) return null;
-  const bytes = Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='), c => c.charCodeAt(0));
-  return b64(bytes) === value ? bytes : null;
+  if (typeof value !== 'string' || !canonicalTokenPattern.test(value)) return null;
+  return Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='), c => c.charCodeAt(0));
 }
 
 function equalBytes(a, b) {
@@ -74,23 +75,18 @@ const importMAC = key => subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA
 const derivationSalt = textEncoder.encode('cf-tgproxy-portal-v1');
 // The offline setup tool fills this value in the private Dashboard copy.
 const dashboardSeed = '';
-let cachedConfig, storedSeed, passwordSeed;
+const configurations = new Map();
+const MAX_CONFIGURATIONS = 8;
+let storedSeed;
 
-async function derivePasswordSeed(env, host) {
-  const value = passwordSetting(env);
-  if (passwordSeed && passwordSeed.value === value && passwordSeed.host === host) return passwordSeed.seed;
-  const password = portalPassword(env);
-  if (!password) return null;
+async function derivePasswordSeed(password, host) {
   const key = await subtle.importKey('raw', password, 'PBKDF2', false, ['deriveBits']);
-  const bits = await subtle.deriveBits({
+  return subtle.deriveBits({
     name: 'PBKDF2',
     hash: 'SHA-256',
     salt: textEncoder.encode('cf-tgproxy-dashboard-v1\0' + host),
     iterations: 16000,
   }, key, 256);
-  const seed = hexString(new Uint8Array(bits));
-  passwordSeed = { value, host, seed };
-  return seed;
 }
 
 export class ProxySeedStore {
@@ -130,13 +126,36 @@ async function configuration(env, host, initialize = false) {
     }
   }
   // Persisted and manually prepared seeds take precedence over password-only setup.
-  seed ??= dashboardSeed || await derivePasswordSeed(env, host);
-  if (typeof seed !== 'string' || !accessCodePattern.test(seed)) return null;
-  const key = seed.toLowerCase();
-  if (cachedConfig?.seed === key && cachedConfig.host === host) return cachedConfig;
+  seed ??= dashboardSeed || undefined;
+  const fromPassword = seed === undefined;
+  if (!fromPassword && (typeof seed !== 'string' || !accessCodePattern.test(seed))) return null;
+  const source = fromPassword ? passwordSetting(env) : seed.toLowerCase();
+  const cached = configurations.get(host);
+  if (cached?.source === source && cached?.fromPassword === fromPassword) {
+    configurations.delete(host);
+    configurations.set(host, cached);
+    return cached.result;
+  }
+  // Only pure WebCrypto work is shared. The legacy binding fetch above
+  // stays in the invocation that owns the I/O.
+  const password = fromPassword ? portalPassword(env) : null;
+  if (fromPassword && !password) return null;
+  const result = deriveConfiguration(host, password, source);
+  const entry = { source, fromPassword, result };
+  configurations.delete(host);
+  configurations.set(host, entry);
+  if (configurations.size > MAX_CONFIGURATIONS) configurations.delete(configurations.keys().next().value);
+  try {
+    return await result;
+  } catch (error) {
+    if (configurations.get(host) === entry) configurations.delete(host);
+    throw error;
+  }
+}
 
-  const portalBytes = hex(key);
-  const masterKey = await subtle.importKey('raw', portalBytes, 'HKDF', false, ['deriveBits']);
+async function deriveConfiguration(host, password, source) {
+  const seed = password ? await derivePasswordSeed(password, host) : hex(source);
+  const masterKey = await subtle.importKey('raw', seed, 'HKDF', false, ['deriveBits']);
   const derive = (purpose, length) => subtle.deriveBits({
     name: 'HKDF',
     hash: 'SHA-256',
@@ -149,9 +168,7 @@ async function configuration(env, host, initialize = false) {
   ]);
   const proxyKey = new Uint8Array(proxyBits);
   const [bridgeKey, carrierKey] = await Promise.all([importMAC(proxyKey), importMAC(carrierBits)]);
-  const secret = hexString(proxyKey);
-  cachedConfig = { seed: key, host, secret, proxyKey, bridgeKey, carrierKey };
-  return cachedConfig;
+  return { secret: hexString(proxyKey), proxyKey, bridgeKey, carrierKey };
 }
 
 async function verifyBridge(bridgeKey, host, capability) {
@@ -174,16 +191,26 @@ async function issueToken(cfg, host, purpose, expires, id) {
   return b64(bytes);
 }
 
-async function verifyToken(cfg, host, purpose, value, clock = now()) {
+function decodeLiveToken(purpose, value, clock = now()) {
   const bytes = decodeToken(value);
   if (!bytes) return null;
   const expires = view(bytes).getUint32(0);
   const maxAge = purpose === BOOTSTRAP ? BOOT_LIFETIME :
     purpose === SESSION ? TICKET_LIFETIME + BOOT_LIFETIME : GRANT_LIFETIME + BOOT_LIFETIME;
   if (expires <= clock || expires > clock + maxAge) return null;
-  const body = bytes.subarray(0, 16);
-  if (!equalBytes(bytes.subarray(16), await carrierMAC(cfg, host, purpose, body))) return null;
+  return { bytes, expires };
+}
+
+async function authenticateToken(cfg, host, purpose, { bytes, expires }, clock = now()) {
+  if (expires <= clock || !equalBytes(bytes.subarray(16), await carrierMAC(cfg, host, purpose, bytes.subarray(0, 16)))) {
+    return null;
+  }
   return { expires, id: bytes.subarray(4, 16) };
+}
+
+async function verifyToken(cfg, host, purpose, value, clock = now()) {
+  const token = decodeLiveToken(purpose, value, clock);
+  return token && authenticateToken(cfg, host, purpose, token, clock);
 }
 
 async function sessionTickets(cfg, host, expires, id) {
@@ -278,6 +305,8 @@ const groups = new Map();
 const counters = Object.create(null);
 const timingBounds = [10, 25, 50, 100, 200, 400, 800, 1600, 3000, 6000];
 const timings = {
+  bridgeConfig: new Uint32Array(timingBounds.length + 1),
+  bridgePage: new Uint32Array(timingBounds.length + 1),
   client: new Uint32Array(timingBounds.length + 1),
   upgrade: new Uint32Array(timingBounds.length + 1),
   kws: new Uint32Array(timingBounds.length + 1),
@@ -482,19 +511,22 @@ async function route(request, env) {
   const upgrade = api && path === '/api/v1/ws' && method === 'GET' &&
     headers.get('Upgrade')?.toLowerCase() === 'websocket' && parseLaneProtocol(headers);
   const token = (session || renewal) && !headers.has('Cookie') ? bearer(request) : null;
-  if (!(portal || capability || upgrade || token)) return unavailable();
+  const purpose = upgrade || method === 'DELETE' ? SESSION : renewal ? RENEWAL : BOOTSTRAP;
+  const claims = decodeLiveToken(purpose, upgrade ? upgrade.token : token);
+  if (!(portal || (capability && canonicalTokenPattern.test(capability)) || claims)) return unavailable();
   if (portal) {
     const accessCode = env.PORTAL_KEY;
     if (typeof accessCode !== 'string' || !accessCodePattern.test(accessCode) ||
         !equalBytes(hex(path.slice(1)), hex(accessCode))) return unavailable();
   }
 
-  const started = upgrade ? Date.now() : 0;
+  const started = upgrade || capability ? Date.now() : 0;
   const cfg = await configuration(env, host);
   if (!cfg) return unavailable();
 
   if (portal) return portalResponse(host, cfg.secret, request, diagnostics);
   if (capability) {
+    const configured = Date.now();
     if (!(await verifyBridge(cfg.bridgeKey, host, capability))) return unavailable();
     // The verified Bridge request already authenticates the client. It can
     // carry the first ticket while the bridge validates HELLO locally.
@@ -506,12 +538,14 @@ async function route(request, env) {
       issueToken(cfg, host, BOOTSTRAP, expires, id),
       sessionTickets(cfg, host, fastExpiry, id),
     ]);
-    return bridgeResponse(host, boot, { ticket, grant, ttl: fastExpiry - now() });
+    const response = bridgeResponse(host, boot, { ticket, grant, ttl: fastExpiry - now() });
+    observeTiming(timings.bridgeConfig, configured - started);
+    observeTiming(timings.bridgePage, Date.now() - started);
+    return response;
   }
-  if (upgrade) return upgradeLane(request, cfg, host, upgrade, started);
-  const purpose = renewal ? RENEWAL : method === 'DELETE' ? SESSION : BOOTSTRAP;
-  const auth = await verifyToken(cfg, host, purpose, token);
+  const auth = await authenticateToken(cfg, host, purpose, claims);
   if (!auth) return unavailable();
+  if (upgrade) return upgradeLane(request, cfg, host, upgrade, auth, started);
   const deadline = view(auth.id).getUint32(0);
   const key = groupKey(host, auth.id);
   if (method === 'DELETE') {
@@ -550,9 +584,7 @@ function parseLaneProtocol(headers) {
   return { protocol, token: match[1], sid: Number(match[2]) };
 }
 
-async function upgradeLane(request, cfg, host, { protocol, token, sid }, started) {
-  const auth = await verifyToken(cfg, host, SESSION, token);
-  if (!auth) return unavailable();
+function upgradeLane(request, cfg, host, { protocol, sid }, auth, started) {
   const group = getGroup(groupKey(host, auth.id), view(auth.id).getUint32(0));
   if (group?.deleted || group?.used.has(sid)) return unavailable();
   if (!group || group.used.size >= 4096 || group.active >= 64 ||
@@ -576,7 +608,12 @@ async function upgradeLane(request, cfg, host, { protocol, token, sid }, started
     return response;
   } catch {
     if (lane) lane.stop('attach', false);
-    else release();
+    else {
+      release();
+      releaseSocket(server);
+    }
+    group.used.delete(sid);
+    recordedIds--;
     return unavailable();
   }
 }
@@ -792,7 +829,10 @@ async function attemptKWS(host, attempt, fetcher, timeout) {
   let wake;
   const stopped = new Promise(resolve => { wake = () => resolve(null); });
   signal.addEventListener('abort', wake, { once: true });
-  const timer = setTimeout(() => attempt.abort(), timeout);
+  const timer = setTimeout(() => {
+    count('kws-handshake-timeout');
+    attempt.abort();
+  }, timeout);
   try {
     const response = await Promise.race([stopped, fetcher('https://' + host + '/apiws', {
       headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': 'binary' },
@@ -806,11 +846,13 @@ async function attemptKWS(host, attempt, fetcher, timeout) {
     if (!response) return null;
     if (signal.aborted || response.status !== 101 || !response.webSocket ||
         response.headers.get('Sec-WebSocket-Protocol') !== 'binary') {
+      if (!signal.aborted) count(response.status === 101 ? 'kws-handshake-protocol' : 'kws-handshake-http');
       releaseUpgrade(response);
       return null;
     }
     return response.webSocket;
   } catch {
+    if (!signal.aborted) count('kws-handshake-network');
     return null;
   } finally {
     clearTimeout(timer);
@@ -921,6 +963,7 @@ class Lane {
   downBusy = false;
   creditWake = null;
   openTimer = null;
+  expiryTimer = null;
   packetTimer = null;
   nativeTimer = null;
   nativeBytes = [0, 0];
@@ -954,6 +997,9 @@ class Lane {
     socket.addEventListener('error', this.onError);
     socket.accept();
     this.openTimer = setTimeout(() => this.stop('stream-timeout'), this.openMs);
+    if (this.group.expires !== undefined) {
+      this.expiryTimer = setTimeout(() => this.stop('session-expired'), Math.max(0, this.group.expires * 1000 - Date.now()));
+    }
   }
 
   get ended() { return this.phase === 'closed'; }
@@ -1135,7 +1181,9 @@ class Lane {
     this.assertLive();
     const peer = this.peer;
     let wire;
-    const large = bytes.length > BULK_PACK;
+    // A single native call needs at most the previous output + chunk reserve
+    // up to 512 KiB. Bigger packets keep bounded padding scratch space.
+    const large = bytes.length > CRYPT_CHUNK;
     const reserve = large ? bytes.length + 512 * KiB + 64 : 2 * (bytes.length + 32);
     this.budget.hold(reserve);
     try {
@@ -1273,7 +1321,7 @@ class Lane {
           }
           for (let offset = 0; offset < length;) {
             if (!this.sending) await this.waitForCredit();
-            const size = Math.min(this.sending, DOWN_CRYPT, length - offset);
+            const size = Math.min(this.sending, CRYPT_CHUNK, length - offset);
             const reserve = 4 * (size + 32);
             this.budget.hold(reserve);
             try {
@@ -1368,6 +1416,7 @@ class Lane {
     this.phase = 'closed';
     count(kind);
     clearTimeout(this.openTimer);
+    clearTimeout(this.expiryTimer);
     clearTimeout(this.packetTimer);
     clearTimeout(this.nativeTimer);
     this.budget.release(this.nativeBytes[0] + this.nativeBytes[1]);
@@ -1406,6 +1455,7 @@ function runBridge(origin, fast, bootstrap) {
   const fragment = /^#android=([A-Za-z0-9_-]{43})$/.exec(location.hash)?.[1];
   try { history.replaceState(null, '', location.pathname); } catch {}
   let port, started = false, ready = false, closed = false, status;
+  let startupDeadline = 0;
   let ticket = '', grant = '', until = 0, renewal;
   let pendingBytes = 0, pendingItems = 0;
   let trafficTimer = null, sentBytes = 0, receivedBytes = 0;
@@ -1439,7 +1489,7 @@ function runBridge(origin, fast, bootstrap) {
       const length = data.getUint32(offset + 4);
       const end = offset + 8 + length;
       if (length > 1048576 || end > buffer.byteLength) throw Error();
-      fn(id >>> 24, id & 0xffffff, length, offset, end);
+      fn(id >>> 24, id & 0xffffff, length, offset, end, data);
       offset = end;
     }
   }
@@ -1489,11 +1539,15 @@ function runBridge(origin, fast, bootstrap) {
   }
 
   async function request(path, auth, body, code) {
+    const deadline = Math.min(startupDeadline || Infinity, performance.now() + 21500);
     for (let attempt = 0; attempt < 4 && !closed; attempt++) {
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) return null;
       const control = new AbortController();
       const cancel = () => control.abort();
       lifetime.signal.addEventListener('abort', cancel, { once: true });
-      const timer = setTimeout(cancel, 4500);
+      const timer = setTimeout(cancel, Math.min(4500, remaining));
+      let retryAfter = 0;
       try {
         const response = await fetch(origin + path, {
           method: 'POST', body, mode: 'same-origin', credentials: 'omit',
@@ -1501,12 +1555,14 @@ function runBridge(origin, fast, bootstrap) {
           headers: { Authorization: 'Bearer ' + auth, ...(body && { 'Content-Type': 'application/octet-stream' }) },
           signal: control.signal,
         });
-        if (response.status === code) {
+        if (response.status === code && !control.signal.aborted) {
           const welcome = body ? await response.arrayBuffer() : null;
-          return { response, welcome };
+          if (!control.signal.aborted && performance.now() <= deadline) return { response, welcome };
         }
-        if (response.status !== 503) return null;
         response.body?.cancel().catch(() => {});
+        if (!control.signal.aborted && response.status !== 503) return null;
+        const seconds = response.headers.get('Retry-After');
+        if (response.status === 503 && /^\d+$/.test(seconds ?? '')) retryAfter = Number(seconds) * 1000;
       } catch {
         if (closed) return null;
       } finally {
@@ -1514,7 +1570,8 @@ function runBridge(origin, fast, bootstrap) {
         lifetime.signal.removeEventListener('abort', cancel);
       }
       if (attempt < 3) {
-        const delay = 250 * 2 ** attempt + Math.random() * 120;
+        const delay = Math.max(retryAfter, 250 * 2 ** attempt) + Math.random() * 120;
+        if (closed || delay >= deadline - performance.now()) return null;
         await new Promise(resolve => {
           const timer = setTimeout(done, delay);
           lifetime.signal.addEventListener('abort', done, { once: true });
@@ -1537,7 +1594,6 @@ function runBridge(origin, fast, bootstrap) {
   }
 
   async function currentTicket() {
-    if (until - performance.now() > 10000) return ticket;
     // All lanes opened together share a renewal, while established lanes continue.
     renewal ??= (async () => {
       const result = await request('/api/v1/session/renew', grant, undefined, 204);
@@ -1601,34 +1657,40 @@ function runBridge(origin, fast, bootstrap) {
     if (lane.opening || lane.done || closed) return;
     lane.opening = true;
     try {
-      const auth = await currentTicket();
+      const auth = until - performance.now() > 10000 ? ticket : await currentTicket();
       if (closed || lane.done) return;
+      const remaining = startupDeadline ? startupDeadline - performance.now() : 8000;
+      if (remaining <= 0) { fail(); return; }
       const protocol = 'tproxy-lane-v1.' + auth + '.' + lane.id;
       const ws = lane.socket = new WebSocket(WS, protocol);
       ws.binaryType = 'arraybuffer';
       lane.handshake = setTimeout(() => {
         if (!lane.done && lane.socket === ws && !lane.opened) fail();
-      }, 8000);
+      }, Math.min(8000, remaining));
       ws.onopen = () => {
         if (closed || lane.done || lane.socket !== ws) { ws.close(); return; }
         if (ws.protocol !== protocol) { fail(); return; }
         clearTimeout(lane.handshake);
         lane.opened = true;
+        startupDeadline = 0;
         try { flush(lane); } catch { finish(lane, true); }
       };
       ws.onmessage = event => {
         if (closed || lane.done || lane.socket !== ws) return;
         try {
           let ended = false;
-          eachFrame(event.data, (type, id, length, start) => {
+          let boundaries;
+          eachFrame(event.data, (type, id, length, start, end, view) => {
             if (id !== lane.id || ended) throw Error();
+            if (port.postFrames && (start || end < event.data.byteLength)) (boundaries ??= []).push(end);
             if (type === 3 && !length) ended = true;
             else if (type === 2 && length) return;
-            else if (type === 4 && length === 4 && new DataView(event.data).getUint32(start + 8)) return;
+            else if (type === 4 && length === 4 && view.getUint32(start + 8)) return;
             else throw Error();
           });
           noteTraffic(0, event.data.byteLength);
-          port.postMessage(event.data, [event.data]);
+          if (boundaries) port.postFrames(event.data, boundaries);
+          else port.postMessage(event.data, [event.data]);
           if (ended) finish(lane, false);
         } catch { fail(); }
       };
@@ -1646,7 +1708,7 @@ function runBridge(origin, fast, bootstrap) {
     let buffered = 0;
     const touched = new Set();
     for (const lane of lanes.values()) buffered += lane.socket?.bufferedAmount ?? 0;
-    eachFrame(buffer, (type, id, length, start, end) => {
+    eachFrame(buffer, (type, id, length, start, end, view) => {
       if (closed) return;
       if (!id) throw Error();
       let lane = lanes.get(id);
@@ -1659,7 +1721,7 @@ function runBridge(origin, fast, bootstrap) {
         if (lane) finish(lane, false);
         return;
       } else if (!(type === 2 && length) &&
-                 !(type === 4 && length === 4 && new DataView(buffer).getUint32(start + 8))) throw Error();
+                 !(type === 4 && length === 4 && view.getUint32(start + 8))) throw Error();
       if (!lane) return; // Late DATA or WINDOW for a lane that has closed.
       const size = end - start;
       if (pendingBytes + buffered + size > 33554432 || pendingItems >= 16384 ||
@@ -1726,6 +1788,7 @@ function runBridge(origin, fast, bootstrap) {
             if (hello.byteLength !== 9 || hello.getUint32(0) !== 0x10000000 ||
                 hello.getUint32(4) !== 1 || hello.getUint8(8) !== 1) throw Error();
             started = true;
+            startupDeadline = performance.now() + 30000;
             void create(data);
           } else if (ready) enqueue(data);
           else throw Error();
@@ -1754,12 +1817,13 @@ function runBridge(origin, fast, bootstrap) {
       start() {},
       close() { injected.onmessage = null; },
       postMessage(value) {
-        if (value instanceof ArrayBuffer) {
-          eachFrame(value, (type, id, length, start, end) => {
-            injected.postMessage(start === 0 && end === value.byteLength ? value : value.slice(start, end));
-          });
-        } else {
-          injected.postMessage(JSON.stringify(value));
+        injected.postMessage(value instanceof ArrayBuffer ? value : JSON.stringify(value));
+      },
+      postFrames(buffer, boundaries) {
+        let start = 0;
+        for (const end of boundaries) {
+          injected.postMessage(buffer.slice(start, end));
+          start = end;
         }
       },
     };
@@ -1886,6 +1950,8 @@ function portalDiagnostics(request) {
     '<dt>Worker 放置（cf-placement）</dt><dd>' + workerPlacement + '</dd>' +
     '<dt>客户端到 Cloudflare RTT</dt><dd>' + pageRtt + '</dd></dl>' +
     '<p>以下采样来自本实例已接受或建连成功的代理连接。P95 按区间显示。</p><dl>' +
+    '<dt>Bridge 配置与密钥准备</dt><dd>' + timingSummary(timings.bridgeConfig) + '</dd>' +
+    '<dt>Worker 处理 Bridge 页面</dt><dd>' + timingSummary(timings.bridgePage) + '</dd>' +
     '<dt>代理升级请求的入口 RTT</dt><dd>' + timingSummary(timings.client) + '</dd>' +
     '<dt>Worker 处理 WebSocket 升级</dt><dd>' + timingSummary(timings.upgrade) + '</dd>' +
     '<dt>Worker 到 KWS 建连</dt><dd>' + timingSummary(timings.kws) + '</dd>' +

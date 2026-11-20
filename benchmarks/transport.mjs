@@ -24,6 +24,8 @@ const workloads = [
   ['交互与媒体', [[160, 124, 1], [64, 65532, 8], [96, 8188, 12]]],
   ['连续大块', [[96, 131068, 8]]],
   ['512 KiB 媒体包', [[32, 524284, 2]]],
+  ['持续下载', [[128, 131068, 8, 'down']]],
+  ['持续上传', [[64, 524284, 4, 'up']]],
 ];
 
 class Socket extends FakeSocket {
@@ -56,7 +58,7 @@ function openFixture() {
   });
 }
 
-async function start(version, id, [count, size, burst]) {
+async function start(version, id, [count, size, burst, direction]) {
   const fixture = transportFixture(0xdd, id);
   const client = new Socket();
   let peer, current;
@@ -92,7 +94,10 @@ async function start(version, id, [count, size, burst]) {
   for (let i = 0; i < count; i += burst) {
     const batch = [];
     for (let pos = i; pos < Math.min(count, i + burst); pos++) {
-      batch.push([encodeFrame(2, id, fixture.toWorker.update(payload)), reverse.update(payload)]);
+      batch.push([
+        direction !== 'down' ? encodeFrame(2, id, fixture.toWorker.update(payload)) : null,
+        direction !== 'up' ? reverse.update(payload) : null,
+      ]);
     }
     batches.push(batch);
   }
@@ -103,29 +108,30 @@ async function start(version, id, [count, size, burst]) {
       if (current) await until(() => !current.upBusy && !current.downBusy);
     },
     async replay(latencies, probe) {
-      let expected = 0;
+      let upBytes = 0, downBytes = 0;
       for (const batch of batches) {
         const time = performance.now();
-        expected += batch.length * payload.length;
+        if (direction !== 'down') upBytes += batch.length * payload.length;
+        if (direction !== 'up') downBytes += batch.length * payload.length;
         await new Promise((resolve, reject) => {
           const timer = setTimeout(() => reject(new Error('bench lane timed out')), 5000);
           wake = () => {
-            if (downstream < expected || credit < expected + 64) return;
+            if (downstream < downBytes || credit < upBytes + 64) return;
             wake = null;
             clearTimeout(timer);
             resolve();
           };
           for (const [up, down] of batch) {
-            client.receive(up);
-            peer.receive(down);
+            if (up) client.receive(up);
+            if (down) peer.receive(down);
           }
         });
         latencies.push(performance.now() - time);
         probe();
       }
-      if (credit !== expected + 64 || downstream !== expected) throw new Error('byte count mismatch');
-      if (peer.sends !== count + 1) throw new Error('KWS frame boundary mismatch');
-      return downstream * 2;
+      if (credit !== upBytes + 64 || downstream !== downBytes) throw new Error('byte count mismatch');
+      if (peer.sends !== (direction === 'down' ? 1 : count + 1)) throw new Error('KWS frame boundary mismatch');
+      return upBytes + downBytes;
     },
   };
 }

@@ -158,6 +158,26 @@ it('lets the first login retry after a temporary storage error', async () => {
 
 afterEach(() => vi.restoreAllMocks());
 
+it('shares password derivation per host and evicts a rejected crypto result', async () => {
+  const derive = vi.spyOn(crypto.subtle, 'deriveBits');
+  const config = { p: 'synthetic-concurrent-configuration' };
+  const host = 'concurrent.example.com';
+  const concurrent = await Promise.all(Array.from({ length: 8 }, () => configuration(config, host)));
+  expect(new Set(concurrent).size).toBe(1);
+  expect(derive.mock.calls.map(([algorithm]) => algorithm.name)).toEqual(['PBKDF2', 'HKDF', 'HKDF']);
+  const alternate = await configuration(config, 'alternate.example.com');
+  expect(alternate.secret).not.toBe(concurrent[0].secret);
+  expect(await configuration(config, host)).toBe(concurrent[0]);
+
+  const rotated = { p: 'synthetic-rotated-configuration' };
+  derive.mockRejectedValueOnce(new Error('synthetic crypto failure'));
+  const failed = await Promise.allSettled([configuration(rotated, host), configuration(rotated, host)]);
+  expect(failed.map(result => result.status)).toEqual(['rejected', 'rejected']);
+  const replacement = await configuration(rotated, host);
+  expect(replacement.secret).not.toBe(concurrent[0].secret);
+  expect((await configuration(config, host)).secret).toBe(concurrent[0].secret);
+});
+
 describe('MTProto and WEB Proxy wire formats', () => {
   it.each([
     ['000102030405060708090a0b0c0d0e0f', 'MHLEY5PmW1GWqJkSrlmJpvJUiLhBH_QKy6yKg8a0JPk'],

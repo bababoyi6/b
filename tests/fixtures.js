@@ -68,11 +68,10 @@ export function independentCTR(head, secret, reverse) {
   return createCipheriv('aes-256-ctr', derived, material.subarray(32));
 }
 
-export function transportFixture(mode = 0xdd, dc = -2) {
+export function transportFixture(mode = 0xdd, dc = -2, secret = Buffer.from(PROXY_SECRET, 'hex')) {
   const head = Buffer.from(Array.from({ length: 64 }, (_, i) => (i * 13 + 23) & 255));
   head.fill(mode, 56, 60);
   head.writeInt16LE(dc, 60);
-  const secret = Buffer.from(PROXY_SECRET, 'hex');
   const toWorker = independentCTR(head, secret, false);
   const fromWorker = independentCTR(head, secret, true);
   const wire = toWorker.update(head);

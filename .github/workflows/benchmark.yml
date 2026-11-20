@@ -4,9 +4,9 @@ on:
   push:
     branches: [main]
     tags: ['v*']
-    paths: [telegram_webproxy.js, 'benchmarks/**']
+    paths: [telegram_webproxy.js, 'benchmarks/**', tests/fixtures.js]
   pull_request:
-    paths: [telegram_webproxy.js, 'benchmarks/**']
+    paths: [telegram_webproxy.js, 'benchmarks/**', tests/fixtures.js]
   workflow_dispatch:
 
 permissions:
@@ -16,6 +16,8 @@ jobs:
   compare:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      BENCHMARK_BASELINE: 9bae14677f663670fceed2e007b6b3d6b4347368
     steps:
       - uses: actions/checkout@v6
         with:
@@ -24,6 +26,10 @@ jobs:
         with:
           node-version: '24'
       - if: github.event_name == 'workflow_dispatch' || github.ref_type == 'tag'
-        run: npm run bench
+        run: |
+          npm run bench -- --against="$BENCHMARK_BASELINE"
+          npm run bench:startup -- --against="$BENCHMARK_BASELINE"
       - if: github.event_name != 'workflow_dispatch' && github.ref_type != 'tag'
-        run: npm run bench -- --quick
+        run: |
+          npm run bench -- --quick --against="$BENCHMARK_BASELINE"
+          npm run bench:startup -- --quick --against="$BENCHMARK_BASELINE"

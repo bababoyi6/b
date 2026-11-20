@@ -1,5 +1,98 @@
 # 工程验收记录
 
+## 2026-11-20 单文件部署版
+
+固定基线为拉取时 GitHub `main` 的 `9bae14677f663670fceed2e007b6b3d6b4347368`。本地原有 `main` 为 `37dd816`，双方历史已分叉。优化分支从 GitHub 的提交创建。以下是本轮对照，后面的历史数据使用其他基线。 [固定基线](https://github.com/bababoyi6/b/tree/9bae14677f663670fceed2e007b6b3d6b4347368)
+
+### 首连与故障恢复
+
+- 同一 isolate 内，相同域名和配置共用一次 WebCrypto 密钥派生。缓存最多八个域名，配置变化后按新值导出，失败的初始化可重试。历史 Durable Object 读取留在发起请求的调用中。PBKDF2-SHA256 保持 16,000 次，盐、HKDF 上下文和签发格式继续兼容。
+- 有效内联票据在本地验证 HELLO 后直接返回 WELCOME。接近过期时用同一父会话走幂等 Session 创建，多 lane 共用续签。HTTP 明确拒绝立即结束，503 按 `Retry-After` 秒数退避，网络失败最多尝试四次。创建或续签各有 21.5 秒上限。首次客户端 Upgrade 受 HELLO 后 30 秒总预算约束，单次 Upgrade 上限为 8 秒。退出页面会取消请求和定时器。新 lane 握手失败由客户端重建父会话，已建 lane 断开只终止对应流。
+- 收到完整混淆头后才拨号。保持 KWS 每次 3 秒、慢主连接 900 毫秒后启动备用、每实例最多八个并行备用竞速。主连接明确失败会立即试备用，关闭落败和晚到连接。新增 HTTP、子协议、网络与超时计数。Worker 仍有 12 秒等待流头与建立上游。握手后首批有效响应取决于客户端数据和 KWS。
+- `/admin` 新增 Bridge 配置与页面耗时，已有 Upgrade、KWS、第一批上游字节和第一批转发统计。只统计当前 isolate。生产采样分辨率受 Workers 时钟影响。WebView 启动、DNS、TCP、TLS 和真实网络耗时需在客户端和在线域名上采集。 [Worker 源码](../telegram_webproxy.js) · [首包基准](../benchmarks/startup.mjs)
+
+首包基准运行实际 Bridge 脚本、路由、票据、lane 和加解密，WebSocket 与 KWS 在 Node.js 进程内模拟。模块加载单列，其他阶段从 Bridge 请求开始累计。预热后两版交替各 40 轮。三种单连接场景各 40/40 成功，超时和 Session POST 均为 0。主入口立即失败的场景每次拨号两次，其余每次一次。分位尾部样本不足以报告 P99。
+
+| 场景或阶段 | 基线 P50 / P95（ms） | 新版 P50 / P95（ms） |
+| --- | ---: | ---: |
+| 冷模块加载 | 3.297 / 4.331 | 3.646 / 4.904 |
+| 冷 Bridge 页面 | 3.329 / 3.925 | 3.303 / 3.923 |
+| 冷 Bridge 脚本初始化 | 4.105 / 4.705 | 4.046 / 4.740 |
+| 冷 Session Ready（WELCOME） | 4.250 / 4.848 | 4.158 / 4.852 |
+| 冷 WebSocket Upgrade | 4.982 / 5.624 | 4.930 / 5.726 |
+| 冷 KWS Connected | 5.854 / 6.589 | 5.803 / 6.664 |
+| 冷首批上游字节 | 6.240 / 7.057 | 6.221 / 7.130 |
+| 冷首批转发字节 | 6.683 / 7.550 | 6.687 / 7.557 |
+| 热首批转发字节 | 2.050 / 2.225 | 2.051 / 2.305 |
+| KWS 主入口失败后，备用首批转发字节 | 6.580 / 6.953 | 6.622 / 7.281 |
+| 同域八个冷 Bridge 页面全部完成 | 6.523 / 7.296 | 4.418 / 4.616 |
+
+八个冷请求的耗时范围为 6.170–8.990 → 4.122–4.766 ms。每轮 PBKDF2 8 → 1 次，HKDF 中位数 10 → 2 次，CryptoKey 导入中位数 23 → 4 次，HMAC 签名和验证均为 32 次。前一轮并发冷请求的 P95 为 7.633 → 5.900 ms。单连接冷首批转发 P95 持平，冷模块加载 P95 上升。首批转发是代理层指标。Telegram 登录、消息同步和客户端断线重连耗时尚待实测。
+
+### 数据传输对照
+
+256 KiB 以上、最多 512 KiB 的上传包可用一次 WebCrypto 调用得到 KWS 密文，省去分段结果拼接。大于 512 KiB 的包继续按 256 KiB 加密。KWS 消息边界和预算上限沿用基线。Bridge 记录已校验下行帧的位置，直接交给原生 WebView，MessagePort 继续转移原批次。扩大 Worker 下行合批的实验拖慢了双向连续负载。收窄实验后，单向下载的 ArrayBuffer 采样峰值仍由约 16 MiB 增至 28 MiB。两项实验均已撤回。
+
+Windows 上 Node.js 24.16.0，16 个逻辑 CPU。两版各预热一次，交替七轮。吞吐为中位数［最小–最大］，延迟为各轮批完成延迟分位数的中位数。持续下载为 16 MiB、每包 128 KiB，持续上传为 32 MiB、每包 512 KiB。混合负载同时运行一条交互 lane 和两条媒体 lane。 [可复现基准](../benchmarks/transport.mjs)
+
+| 本地负载 | 吞吐 MiB/s，基线 → 新版 | P50 / P95 ms，基线 → 新版 |
+| --- | --- | --- |
+| 交互小包 | 1.498［1.415–1.549］→ 1.422［1.314–1.512］ | 0.072 / 0.108 → 0.074 / 0.120 |
+| 交互与媒体 | 316.7［284.2–350.6］→ 325.8［308.0–340.8］ | 0.089 / 2.009 → 0.089 / 1.962 |
+| 连续大块双向 | 810.1［698.3–1586.8］→ 1119.3［786.8–1627.4］ | 2.347 / 4.727 → 1.310 / 2.842 |
+| 512 KiB 双向 | 1332.8［1281.4–1462.1］→ 1377.9［1250.7–1424.4］ | 1.167 / 2.993 → 1.130 / 2.655 |
+| 持续下载 | 858.0［421.6–888.9］→ 858.6［719.3–865.5］ | 1.068 / 1.794 → 1.101 / 1.620 |
+| 持续上传 | 1195.7［913.2–1285.8］→ 1643.4［826.3–1735.7］ | 1.510 / 2.730 → 1.118 / 2.457 |
+
+| 本地负载 | AES 调用 | KWS / Worker 客户端发送 | ArrayBuffer 采样峰值增量（MiB） | 进程 CPU 中位数（ms） |
+| --- | --- | --- | --- | --- |
+| 交互小包 | 880 → 880 | 220 / 440 → 220 / 440 | 0 → 0 | 0 → 0 |
+| 交互与媒体 | 864 → 864 | 320 / 432 → 320 / 432 | 0 → 0 | 16 → 0 |
+| 连续大块双向 | 384 → 384 | 96 / 192 → 96 / 192 | 5.011 → 0 | 0 → 0 |
+| 512 KiB 双向 | 160 → 128 | 32 / 64 → 32 / 64 | 0 → 0 | 0 → 15 |
+| 持续下载 | 256 → 256 | 0 / 128 → 0 / 128 | 0 → 0 | 0 → 0 |
+| 持续上传 | 192 → 128 | 64 / 64 → 64 / 64 | 13.003 → 0 | 0 → 0 |
+
+上传的 AES 调用下降与本地持续上传的 P95 改善均在复跑中出现，前一轮 P95 为 3.262 → 2.348 ms。持续下载未测得稳定吞吐提升。双向大块的吞吐范围高度重叠，ArrayBuffer 峰值增量范围为 0–8.761 → 0–12.011 MiB。CPU 读数大多为 0 或约 16 ms。内存采样受 GC 和时间间隔影响，0 代表未抓到增量。边缘 CPU、真实 isolate 峰值与公网吞吐待实测。
+
+### 安全审计
+
+| 严重度 | 发现 | 处理与剩余风险 |
+| --- | --- | --- |
+| 中 | 并发冷请求重复派生，过期或编码不合法的票据可先触发冷配置 | 共用密钥派生，先检查票据编码和期限，再进行签名校验。格式正确的 Bridge 能力码仍需要派生后的密钥来验证。回归覆盖并发、初始化失败重试、密码及域名变化。 |
+| 中 | 父会话到期后已建立的 lane 可继续占用资源 | 在父授权到期时关闭 lane。空闲 lane 超期释放有回归。DELETE、流 ID、配额和登录限流仍是 isolate 局部状态。跨实例重放和全局即时撤销需共享状态。 |
+| 中 | 单 Secret 模式的代理密钥由域名和密码确定 | 保持派生参数以兼容已发行链接。泄露代理密钥或可长期使用的 Bridge 能力码时，可离线校验密码猜测。使用独立高熵密码并保护链接。旧随机种子部署继续使用独立密钥来源。 |
+| 低 | 错误 Upgrade 和慢流可占用资源 | Upgrade 响应构造失败时归还配额及流 ID。实例、会话和 lane 继续限制字节数和条目数。验证慢流隔离、窗口恢复和异常关闭。入站消息投递给 JS 前的原生分配由平台管理。 |
+| 低 | 认证材料随请求元数据传输，KWS 路由需受控 | KWS 只访问 DC 1–5 的官方 HTTPS 主机，禁用重定向并校验 `binary` 子协议。应用无凭证日志或第三方采集。部署侧日志也须保护 URL 查询、`Authorization` 和 `Sec-WebSocket-Protocol`。 |
+
+认证继续使用域名绑定、HMAC 用途隔离、定时安全比较、登录限流、同源表单、CSP 与 Secure/HttpOnly/SameSite Cookie。密码变化使旧管理 Cookie 无效。已建立的代理连接按其生命周期结束。
+
+### 默认载体、免费版和三网
+
+- 默认采用 `websocket-lanes`。单 WebSocket 可减少 Upgrade，同时共享发送队列和断线范围。官方规范要求拒绝同一 relay session 的第二条载体。无共享状态时，不同 isolate 可同时校验同一票据，无法跨实例原子拒绝。单 Worker 调用内多流拨号还需处理六个等待响应头的连接及 50 个 Free 子请求的累计限额。本轮完成协议及架构核对，未实现复用载体或执行两种载体的真机 A/B。 [Telegram 载体协议](https://github.com/telegramdesktop/tproxy-server/blob/master/PROTOCOL.md#carrier-modes) · [Workers 限额](https://developers.cloudflare.com/workers/platform/limits/)
+- Free 当前公布每个 HTTP 请求 10 ms CPU、每 isolate 128 MB、每日 100,000 请求。单 lane 最多发起两个 KWS 请求。单文件 p-only 方案无额外绑定。真实 workerd 以 2026-11-18 兼容性日期验证 `arraybuffer` 和 Close 回送。平台 WebSocket 入站限制为 32 MiB，应用载体消息上限为 2 MiB。运行时更新可断开仍在使用的连接。 [Workers 限额](https://developers.cloudflare.com/workers/platform/limits/) · [WebSocket 运行时](https://developers.cloudflare.com/workers/runtime-apis/websockets/)
+- 默认沿用 Custom Domain 和默认放置。Anycast 入口、Worker 执行位置与 KWS 出站目标是三个测量点。Smart Placement 与香港、东京、新加坡提示须通过 Cloudflare 配置启用，只影响 Worker 放置。电信、联通、移动尚无配对数据。应按运营商记录连接成功率、冷暖首包、断线、交互 P95、未缓存下载和上传吞吐，再决定放置。 [Cloudflare Placement](https://developers.cloudflare.com/workers/configuration/placement/) · [可选亚太配置](../wrangler.apac.jsonc)
+
+### 实际运行
+
+| 命令 | 结果 |
+| --- | --- |
+| `node --check telegram_webproxy.js`、`node --check benchmarks/startup.mjs` | 通过 |
+| `npm test` | 39 项通过。覆盖独立 CTR、三种 transport、最大包、票据、退避与取消、KWS 主备和 lane 关闭 |
+| `npm run test:runtime` | 5 项通过。覆盖 workerd WebSocketPair、Close、二进制类型与缓冲、单 Secret 并发冷 Bridge、登录及 Upgrade |
+| `npm run bench -- --against=9bae14677f663670fceed2e007b6b3d6b4347368` | 每版每负载七轮，校验字节数及 KWS 消息边界 |
+| `npm run bench:startup -- --against=9bae14677f663670fceed2e007b6b3d6b4347368` | 每版每场景四十轮，校验返回明文字节 |
+
+使用 Vitest 4.1.12、Cloudflare Vitest 插件 1.8.5、workerd 1.20261118.1。最终回归无失败或跳过。GitHub Actions 远端流水线、Cloudflare 在线 CPU 和内存、长时间实网断连、Desktop/iOS/Android 发行版互通及中国大陆三网未执行。本地模拟无法确认 Cloudflare Free 在线 CPU 是否始终满足上限。 [回归工作流](../.github/workflows/regression.yml) · [基准工作流](../.github/workflows/benchmark.yml)
+
+### 密钥来源与回滚
+
+- 单 Secret 部署升级时沿用现有域名和 `p`，旧 Telegram 链接可继续使用。原先启用 `PROXY_SEED`、`PORTAL_KEY` 或 `PROXY_STATE` 的部署继续保留相同 Secret 和绑定。历史部署配置仍支持 `PROXY_STATE`。
+- 如果旧 JS 使用[离线工具](../prepare-dashboard.html)填入了随机种子，升级时须沿用原种子。可以使用同一个种子生成新的私有部署文件，历史 `PROXY_SEED` 也支持原种子。
+- 在 Cloudflare Dashboard 的 **部署** 中回滚到上一次可用版本。也可重新粘贴本轮基线 JS，沿用原密钥和域名，从 Telegram 重连。单 Secret 版本以 `9bae146` 为回退基线。 [基线源文件](https://github.com/bababoyi6/b/blob/9bae14677f663670fceed2e007b6b3d6b4347368/telegram_webproxy.js) · [Cloudflare 回滚](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/)
+
+## 历史记录
+
 在此源码包中运行 `npm run bench` 即可测当前版本。如需和旧版本对照，可用 `npm run bench -- --against=提交号`，对应提交需已存在于本地。
 
 上游基线是 `e565c57ff58656fd544755f67e1c266148c0b88f`。WEB 协议核对版本是 `c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8`。 [上游源码](https://github.com/ToiCF/CF-Workers-TGProxy/blob/e565c57ff58656fd544755f67e1c266148c0b88f/telegram_webproxy.js) · [WEB 协议](https://github.com/telegramdesktop/tproxy-server/blob/c8adb8b7c6b7fc46c12ae3acb68be9070c26a8e8/PROTOCOL.md)

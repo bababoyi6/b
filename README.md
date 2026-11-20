@@ -11,23 +11,14 @@
 3. 在 **设置 → 域名和路由 → 添加 → 自定义域名** 绑定域名。访问域名会看到 **Welcome to nginx!**。[Cloudflare 域名设置](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/)
 4. 打开域名后的 `/admin`，输入密码。登录后直接点 **打开 Telegram** 或 **复制链接**。
 
-只设置 `p` 时，Worker 会按域名和密码派生代理密钥。换密码或域名后，从 `/admin` 复制新链接，再添加到 Telegram。
-
-## 一键部署
-
-[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/bababoyi6/b)
-
-点按钮后按提示连接 GitHub，填写密钥 `p`。此方式会自动绑定独立存储，首次登录会生成并保存后台密钥，之后换登录密码仍可继续使用原代理链接。
-
-命令行部署可以运行 `npm ci`、`npx wrangler deploy` 和 `npx wrangler secret put p`。
+只设置 `p` 时，Worker 会按域名和密码派生代理密钥。升级时沿用原域名和 `p`，已添加的链接可继续使用。换密码或域名后，从 `/admin` 复制新链接，再添加到 Telegram。使用旧版存储、`PROXY_SEED`、`PORTAL_KEY` 或离线部署版的用户，更新前先核对原来的密钥来源。[历史部署兼容性](./docs/audit.md#密钥来源与回滚)
 
 ## 遇到问题
 
 - **打开 `/admin` 提示 404**。检查域名是否绑定到了这个 Worker，以及小写的 `p` 是否按密钥类型保存，长度是否足够。
-- **密码正确，登录后仍提示换用部署版**。确认旧代码已用本仓库最新版 `telegram_webproxy.js` 替换并部署。
 - **Telegram 找不到 WEB 代理**。检查客户端版本是否支持。可以先在电脑端试。
-- **能连但下载慢**。登录后点 **连接诊断** 看哪一段花时间。测速度时，用同一台电脑、同一条网络下载未缓存的文件。
+- **能连但下载慢**。登录后点 **连接诊断** 查看当前 Worker 实例的阶段统计。测速时用同一台电脑和同一条网络下载未缓存的文件。
 
-[亚太配置（香港、东京、新加坡）](./wrangler.apac.jsonc) · [测试记录](./docs/audit.md)
+[测试记录与回滚](./docs/audit.md) · [可选亚太配置](./wrangler.apac.jsonc)
 
 按 [GPL-3.0](./LICENSE) 分发。

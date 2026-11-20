@@ -86,6 +86,36 @@ async function create(inline = false) {
   return result.headers.get('X-Session-Token');
 }
 
+it('signs in, serves concurrent Bridges and upgrades using only the password in workerd', async () => {
+  const host = 'dashboard.example.com';
+  const origin = 'https://' + host;
+  const configuration = { p: 'synthetic-dashboard-password' };
+  // Password-only vector derived independently with Node's PBKDF2/HKDF.
+  const capability = '2w8TO5ICl4qQE8JmSUukADb63tfkZGdvlFne8wHXdbk';
+  const request = () => new Request(origin + '/?bridge=' + capability);
+  const bridges = await Promise.all(Array.from({ length: 4 }, () => worker.fetch(request(), configuration)));
+  expect(bridges.map(response => response.status)).toEqual([200, 200, 200, 200]);
+  const login = await worker.fetch(new Request(origin + '/admin', {
+    method: 'POST', headers: { Origin: origin },
+    body: new URLSearchParams({ password: configuration.p }),
+  }), configuration);
+  expect(login.status).toBe(303);
+  const page = await worker.fetch(new Request(origin + '/admin', {
+    headers: { Cookie: login.headers.get('Set-Cookie').split(';', 1)[0] },
+  }), configuration);
+  expect(await page.text()).toContain('&amp;secret=cff9db686d249771b43ec0b598ce8982');
+  const ticket = /"ticket":"([A-Za-z0-9_-]{43})"/.exec(await bridges[0].text())[1];
+  const protocol = 'tproxy-lane-v1.' + ticket + '.1';
+  const upgrade = await worker.fetch(new Request(origin + '/api/v1/ws', {
+    headers: { Upgrade: 'websocket', 'Sec-WebSocket-Protocol': protocol },
+  }), configuration);
+  expect(upgrade.status).toBe(101);
+  expect(upgrade.headers.get('Sec-WebSocket-Protocol')).toBe(protocol);
+  const socket = upgrade.webSocket;
+  socket.accept();
+  socket.close();
+});
+
 function open(token, sid, origin = base) {
   return worker.fetch(new Request(base + '/api/v1/ws', { headers: {
     Upgrade: 'websocket', Origin: origin, 'Sec-WebSocket-Protocol': 'tproxy-lane-v1.' + token + '.' + sid,

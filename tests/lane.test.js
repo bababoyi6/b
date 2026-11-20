@@ -310,3 +310,39 @@ it('refuses an out-of-range or nonnumeric KWS destination without dialing', asyn
   }
   expect(fetcher).not.toHaveBeenCalled();
 });
+
+it('sends an unaligned and an aligned media packet as separate KWS messages', async () => {
+  const fixture = transportFixture();
+  const peer = new FakeSocket();
+  const { lane, group, client } = laneOf(1, fixture, async () => peer);
+  try {
+    client.receive(encodeFrame(2, 1, fixture.wire));
+    const packets = [packet(Buffer.alloc(512 * 1024 - 5, 31)), packet(Buffer.alloc(512 * 1024 - 4, 12))];
+    for (const bytes of packets) client.receive(encodeFrame(2, 1, fixture.toWorker.update(bytes)));
+    await until(() => peer.sent.length === 3 && !lane.upBusy);
+    const { forward } = headers(peer, 0xdd, -2);
+    expect(peer.sent.slice(1).map(wire => forward.update(wire))).toEqual(packets);
+  } finally {
+    client.close();
+  }
+  expect(group.bytes).toBe(0);
+});
+
+it('releases an idle lane when the parent session expires', async () => {
+  vi.useFakeTimers();
+  const group = { ...syntheticGroup(), expires: Math.floor(Date.now() / 1000) + 1 };
+  const client = new FakeSocket();
+  try {
+    const lane = new Lane(client, 1, transportFixture().secret, group);
+    lane.attach();
+    client.receive(encodeFrame(1, 1));
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(lane.ended).toBe(true);
+    expect(client.readyState).toBe(3);
+    expect(group.active).toBe(0);
+    expect(group.bytes).toBe(0);
+  } finally {
+    client.close();
+    vi.useRealTimers();
+  }
+});

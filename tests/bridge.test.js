@@ -3,7 +3,10 @@ import { afterEach, expect, it, vi } from 'vitest';
 import worker, { encodeFrame } from '../telegram_webproxy.js';
 import { ENV, HELLO, ORIGIN, VECTOR, FakeSocket, until } from './fixtures.js';
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 it.each([
   ['fresh inline ticket', 0, 0],
@@ -85,5 +88,38 @@ it.each([
     listeners.get('pagehide')();
   }
   expect(sockets.every(socket => socket.readyState === 3)).toBe(true);
+  expect(injected.onmessage).toBeNull();
+});
+
+it.each([404, 503])('classifies a Session HTTP %s and cancels the pending retry on pagehide', async status => {
+  const response = await worker.fetch(new Request(ORIGIN + '/?bridge=' + VECTOR), ENV);
+  const script = /<script nonce="[^"]+">([\s\S]*?)<\/script>/.exec(await response.text())[1];
+  vi.useFakeTimers();
+  const start = Date.now();
+  const messages = [], listeners = new Map();
+  const injected = { postMessage(data) { messages.push(data); } };
+  const post = vi.fn(async () => new Response(null, { status, headers: { 'Retry-After': '1' } }));
+  runInNewContext(script, {
+    ArrayBuffer, Uint8Array, DataView, URL, AbortController, setTimeout, clearTimeout, parent: {},
+    TelegramWebProxy: injected,
+    location: { hash: '#android=' + 'A'.repeat(43), pathname: '/' },
+    history: { replaceState() {} },
+    addEventListener(name, listener) { listeners.set(name, listener); },
+    Math: Object.assign(Object.create(Math), { random: () => 0 }),
+    performance: { now: () => Date.now() - start + 82000 },
+    fetch: post,
+  });
+  injected.onmessage({ data: HELLO.buffer });
+  await vi.advanceTimersByTimeAsync(999);
+  expect(post).toHaveBeenCalledTimes(1);
+  if (status === 404) {
+    expect(messages.map(JSON.parse)).toContainEqual({ t: 'close' });
+  } else {
+    await vi.advanceTimersByTimeAsync(1);
+    expect(post).toHaveBeenCalledTimes(2);
+  }
+  listeners.get('pagehide')();
+  await vi.advanceTimersByTimeAsync(30000);
+  expect(post).toHaveBeenCalledTimes(status === 404 ? 1 : 2);
   expect(injected.onmessage).toBeNull();
 });
