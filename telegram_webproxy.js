@@ -74,7 +74,24 @@ const importMAC = key => subtle.importKey('raw', key, { name: 'HMAC', hash: 'SHA
 const derivationSalt = textEncoder.encode('cf-tgproxy-portal-v1');
 // The offline setup tool fills this value in the private Dashboard copy.
 const dashboardSeed = '';
-let cachedConfig, storedSeed;
+let cachedConfig, storedSeed, passwordSeed;
+
+async function derivePasswordSeed(env, host) {
+  const value = passwordSetting(env);
+  if (passwordSeed && passwordSeed.value === value && passwordSeed.host === host) return passwordSeed.seed;
+  const password = portalPassword(env);
+  if (!password) return null;
+  const key = await subtle.importKey('raw', password, 'PBKDF2', false, ['deriveBits']);
+  const bits = await subtle.deriveBits({
+    name: 'PBKDF2',
+    hash: 'SHA-256',
+    salt: textEncoder.encode('cf-tgproxy-dashboard-v1\0' + host),
+    iterations: 16000,
+  }, key, 256);
+  const seed = hexString(new Uint8Array(bits));
+  passwordSeed = { value, host, seed };
+  return seed;
+}
 
 export class ProxySeedStore {
   constructor(state) {
@@ -112,7 +129,8 @@ async function configuration(env, host, initialize = false) {
       storedSeed = { id: storageId, seed };
     }
   }
-  seed ??= dashboardSeed;
+  // Persisted and manually prepared seeds take precedence over password-only setup.
+  seed ??= dashboardSeed || await derivePasswordSeed(env, host);
   if (typeof seed !== 'string' || !accessCodePattern.test(seed)) return null;
   const key = seed.toLowerCase();
   if (cachedConfig?.seed === key && cachedConfig.host === host) return cachedConfig;
@@ -422,9 +440,6 @@ async function routePortal(request, env, url, host) {
       count('configuration-error');
       return null;
     });
-    if (!cfg && env.PROXY_SEED === undefined && env.PORTAL_KEY === undefined && !env.PROXY_STATE && !dashboardSeed) {
-      return loginResponse(method, '请换用生成后的控制台部署版 JS，或者通过 Wrangler 部署。', 503, true);
-    }
     if (!cfg) return loginResponse(method, '页面暂时不可用。', 503);
     const token = random(32);
     view(token).setUint32(0, now() + PORTAL_LIFETIME);
@@ -1893,7 +1908,7 @@ Commercial support is available at <a href="https://nginx.com/">nginx.com</a>.</
 <p><em>Thank you for using nginx.</em></p>`);
 }
 
-function loginResponse(method, error = '', status = 200, showSetup = false) {
+function loginResponse(method, error = '', status = 200) {
   return publicPage(method, '站点管理', `<h1>站点管理</h1>
 <form action="${adminPath}" method="post">
   <label for="password">访问密码</label>
@@ -1901,7 +1916,6 @@ function loginResponse(method, error = '', status = 200, showSetup = false) {
   <button type="submit">登录</button>
 </form>
 ${error ? '<p role="alert">' + error + '</p>' : ''}
-${showSetup ? '<p><a href="https://github.com/bababoyi6/b#控制台粘贴部署">查看控制台部署步骤</a></p>' : ''}
 <p><a href="/">返回首页</a></p>`, true, status);
 }
 

@@ -31,10 +31,6 @@ it('allows password setup and keeps portal sessions separate from stable proxy c
   expect((await login(env, password, 'https://other.example.com')).status).toBe(404);
   expect((await login(env, 'incorrect password')).status).toBe(401);
 
-  const missingStorage = await login({ p: password });
-  expect(missingStorage.status).toBe(503);
-  expect(missingStorage.headers.get('Set-Cookie')).toBeNull();
-  expect(await missingStorage.text()).toContain('查看控制台部署步骤');
   expect((await login({ p: password, PROXY_SEED: 'broken' })).status).toBe(503);
 
   const signedIn = await login(env);
@@ -79,6 +75,37 @@ it('allows password setup and keeps portal sessions separate from stable proxy c
   const ip = '192.0.2.6';
   for (let i = 0; i < 8; i++) expect((await login(env, 'incorrect password', ORIGIN, ip)).status).toBe(401);
   expect((await login(env, password, ORIGIN, ip)).status).toBe(429);
+});
+
+it('shows a stable proxy link after signing in with only the password binding', async () => {
+  const p = 'unbound-dashboard-example-password';
+  const env = { p };
+  const signIn = await worker.fetch(new Request(ORIGIN + '/admin', {
+    method: 'POST', body: new URLSearchParams({ password: p }), headers: { Origin: ORIGIN },
+  }), env);
+  expect(signIn.status).toBe(303);
+  expect(signIn.headers.get('Location')).toBe('/admin');
+  const cookie = signIn.headers.get('Set-Cookie').split(';', 1)[0];
+  const admin = await worker.fetch(new Request(ORIGIN + '/admin', { headers: { Cookie: cookie } }), env);
+  const html = await admin.text();
+  const proxyKey = /&amp;secret=([\da-f]{32})/.exec(html)?.[1];
+  expect(proxyKey).toBeTruthy();
+  expect(html).not.toContain(p);
+
+  const salt = Buffer.from('cf-tgproxy-dashboard-v1\0' + HOST);
+  const input = await crypto.subtle.importKey('raw', new TextEncoder().encode(p), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', iterations: 16000, salt }, input, 256);
+  const expected = await configuration({ PROXY_SEED: Buffer.from(bits).toString('hex') }, HOST);
+  expect(proxyKey).toBe(expected.secret);
+  const rotated = { p: 'another-unbound-example-password' };
+  expect((await configuration(rotated, HOST)).secret).not.toBe(proxyKey);
+  expect((await configuration(env, HOST)).secret).toBe(proxyKey);
+  expect((await configuration(env, 'other.example.com')).secret).not.toBe(proxyKey);
+  const mac = await crypto.subtle.sign('HMAC', await crypto.subtle.importKey('raw',
+    Buffer.from(proxyKey, 'hex'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']),
+    new TextEncoder().encode('tdesktop-web-proxy-bridge-v1\n' + HOST));
+  const bridge = await worker.fetch(new Request(ORIGIN + '/?bridge=' + Buffer.from(mac).toString('base64url')), env);
+  expect(bridge.status).toBe(200);
 });
 
 it('signs in with only a password when the Worker source has been prepared for the dashboard', async () => {
